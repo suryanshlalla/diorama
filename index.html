@@ -1,0 +1,3616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diorama — feel prototype</title>
+
+<!--
+  FEEL PROTOTYPE — pan / zoom over a layered diorama.
+
+  Single file, no build step, no network. The only external resources are the
+  PNGs under design-lab/assets, by relative path — the cut-outs as delivered,
+  plus assets/derived/, which design-lab/tools/prepare-assets.py writes by
+  turning each object's baked-on pale contact shadow into honest alpha. Re-run
+  that script whenever an asset is regenerated.
+
+  §-references in the comments point at design-lab/research/diorama-motion.md
+  for the camera, and at design-lab/research/natural-motion.md for the wind and
+  the door swing. Every placement number in the scene layer was measured off
+  the artwork; the comment beside it says how.
+
+  The script is in two halves and they do not know about each other:
+    §1–§4  camera + physics. Pure maths and one DOM-free state machine.
+           This is the part that becomes lib/diorama/* in the real build.
+    §5–§11 scene composition: this file's artwork, DOM, input plumbing,
+           door transition, HUD.
+  Both are reachable from window.Diorama, which is also what the
+  verification harness drives.
+
+  Entry points:
+    prototype-feel.html          starts on the door scene
+    prototype-feel.html#room     skips straight into the room
+-->
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #efece6;
+    color: #14161a;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #app { position: fixed; inset: 0; overflow: hidden; }
+
+  [hidden] { display: none !important; }
+
+  /* ─────────────────────────────────────────────────────────────────────
+     VIEWPORT + STAGE
+     §2.7 — we own every gesture on this element only, never on the page.
+     ───────────────────────────────────────────────────────────────────── */
+  .viewport {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    touch-action: none;
+    overscroll-behavior: none;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: grab;
+  }
+  .viewport[data-dragging="1"] { cursor: grabbing; }
+  .viewport:focus { outline: none; }
+  .viewport:focus-visible { box-shadow: inset 0 0 0 3px #fff, inset 0 0 0 6px #14161a; }
+
+  /* §2.1 — transform-origin MUST be 0 0 or the anchoring algebra is only
+     approximate. The box is the world box: 1306 x 1205, the base plate's
+     natural size, which is WORLD in the script. */
+  .stage {
+    position: absolute;
+    left: 0; top: 0;
+    width: 1306px;
+    height: 1205px;
+    transform-origin: 0 0;
+    /* NO will-change here. §3.3 — it is toggled from script, never declared. */
+  }
+
+  .paint { position: absolute; inset: 0; }
+
+  /* One depth group = one constant 2D pan multiplier. §4.1 */
+  .depth { position: absolute; inset: 0; transform-origin: 0 0; pointer-events: none; }
+  .prop--spinnable { pointer-events: auto; }
+
+  /* NO mix-blend-mode anywhere in this file. Every object in design-lab/assets
+     is a real RGBA cut-out, and design-lab/tools/prepare-assets.py has already
+     turned each one's baked-on pale contact shadow into either honest alpha or
+     nothing at all. multiply was the workaround for opaque-RGB-on-white art;
+     it is what made the desk look transparent, because it also multiplied the
+     wood by whatever was behind it. */
+
+  /* A static clipped aperture. The clip never moves; its children parallax and
+     sway inside it. The room plate's glass is opaque paint, so the tree has to
+     be drawn OVER the plate and cut back to the glass — which is what makes the
+     clip the load-bearing part: it is the only thing standing between the tree
+     canvas and the wall. Its polygons are measured from the plate's own pixels,
+     see WINDOWS. */
+  .slot { position: absolute; inset: 0; }
+
+  .art { position: absolute; display: block; height: auto; -webkit-user-drag: none; }
+
+  /* ── the tree, in pieces ──────────────────────────────────────────────
+     One flat raster can only move as one thing, which is exactly what the
+     owner rejected. The tree is now COMPOSED: far blossom haze, then the
+     trunk, then five separate blossom branches, each a real cut-out hinged
+     at the measured point where its bough runs off its own frame. Each layer
+     carries its own transform-origin inline (measured from its alpha, see
+     TREE_LAYERS), its own amplitude and its own phase lag, so the motion
+     travels through the canopy instead of swinging in sync.
+     No will-change: the running transform is already the compositing reason,
+     and pinning it would fight the zoom's raster scale (diorama-motion §3.3). */
+  .tree-layer { position: absolute; display: block; height: auto; -webkit-user-drag: none; }
+
+  /* ── a BENDING bough (research/branch-bend.md §3.1, §6.2) ─────────────
+     A rigid rotation swings a whole bough like a stick — the owner's exact
+     objection. A real bough is a cantilever: displacement grows toward the
+     tip as roughly s², sub-branches lag the base, blossom shimmers on top.
+     Each bough is therefore a CHAIN of N nested segments. Every .seg is an
+     unclipped wrapper rotated a little about the point where the bough's
+     centreline crosses its seam; inside it, one overflow-hidden .strip shows
+     that segment's band of the SAME image (one decode), and the next .seg
+     rides inside it, so rotations accumulate down the chain and the composite
+     curves. Chain, not fan: a fan shears neighbouring strips against each
+     other by up to 3.7 px at the tip; a chain has zero shear, only a wedge
+     the 8 px overlap hides. */
+  .bough       { position: absolute; }
+  .seg         { position: absolute; inset: 0; }
+  .strip       { position: absolute; overflow: hidden; }
+  .strip > img { position: absolute; left: 0; top: 0; display: block; height: auto; -webkit-user-drag: none; }
+
+  /* The plate's own glass is a warm cream. A scrim over the whole aperture
+     puts sky, haze and branches behind the same pane instead of leaving the
+     composition looking pasted into a hole. */
+  .glaze { position: absolute; inset: 0; pointer-events: none;
+           background: linear-gradient(160deg, rgb(255 246 226 / .30), rgb(255 232 205 / .16) 55%, rgb(246 238 255 / .22)); }
+
+  /* ── desktop objects ──────────────────────────────────────────────────
+     The contact shadow is drawn here rather than left baked into the art, so
+     that a hover can lift the object and grow its shadow — the cheapest signal
+     that a thing is a thing and not a sticker. ::before is the shadow, sized
+     and placed from the object's own footprint by buildProps(). */
+  .prop { position: absolute; }
+  /* height:auto is load-bearing: the width/height ATTRIBUTES on the <img> are
+     presentational hints, so without it the object is stretched to its natural
+     pixel height inside a percentage-width box. */
+  .prop__img { position: absolute; left: 0; top: 0; width: 100%; height: auto;
+               -webkit-user-drag: none;
+               transition: transform 160ms cubic-bezier(.22,.61,.36,1); }
+  .prop::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: calc(100% - var(--sh-y, 0px));         /* up from the object's foot */
+    width: var(--sh-w, 0);
+    height: var(--sh-h, 0);
+    border-radius: 50%;
+    background: rgb(52 40 22 / .38);
+    filter: blur(var(--sh-blur, 3px));
+    /* ONLY opacity transitions here, deliberately. This element carries a
+       blur(), and scaling a blurred element forces the browser to re-run the
+       blur every frame of the transition — ten props each re-blurring on
+       hover is what made pointing at the desk stutter. Opacity on an already
+       rasterised layer is a compositor-only change and costs nothing. */
+    transition: opacity 160ms linear;
+    transform: translate(-50%, -50%);
+  }
+  .prop--noshadow::before { display: none; }
+  .prop:hover::before { opacity: .78; }
+  /* The lift stays: translate is compositor-only and the img carries no
+     filter, so it is cheap. It is also the whole affordance. */
+  .prop:hover .prop__img { transform: translateY(-4%); }
+  /* Fixed props (the chair) keep their painted floor shadow: no lift, or the
+     baked shadow would slide up the carpet with the image. Hover affordance
+     comes from the focus ring and cursor instead. */
+  .prop--fixed:hover .prop__img { transform: none; }
+
+  /* ── THE CHAIR SWIVEL ─────────────────────────────────────────────────
+     A real swivel from one flat image. The turnaround sheet exists but its
+     three rows sit at different camera heights (y-extents 72-383, 59-351,
+     17-327), so playing those frames in sequence makes the chair hop; that
+     needs a re-render at one height before it is usable.
+
+     scaleX does the work instead, and it is not a cheat — it is exactly what
+     an orthographic camera sees as a body turns about its vertical axis:
+     full width face-on, zero edge-on, negative (mirrored) showing the back.
+     Two full turns, decelerating, with a small vertical squash at the fastest
+     part so it has weight rather than looking like a flipping card. The chair
+     keeps its own painted floor shadow, so the transform origin sits at the
+     castors and the shadow turns with it. */
+  .prop--spin-unused .prop__img {
+    animation: chairSwivel 2600ms cubic-bezier(.18,.55,.28,1) both;  /* owner 2026-09-06: 1500ms read as a spin-top */
+    transform-origin: 50% 92%;              /* the castor hub, not the image centre */
+  }
+  @keyframes chairSwivel {
+    0%   { transform: scaleX(1)     scaleY(1); }
+    12%  { transform: scaleX(.30)   scaleY(1.012); }
+    25%  { transform: scaleX(-.85)  scaleY(.994); }
+    37%  { transform: scaleX(-.35)  scaleY(1.010); }
+    50%  { transform: scaleX(.92)   scaleY(.996); }
+    64%  { transform: scaleX(.34)   scaleY(1.006); }
+    78%  { transform: scaleX(-.80)  scaleY(.998); }
+    90%  { transform: scaleX(-.28)  scaleY(1.002); }
+    100% { transform: scaleX(1)     scaleY(1); }
+  }
+  /* Keyboard users get the same affordance the cursor gets. */
+  .jelly-canvas { position: absolute; touch-action: none; }
+  /* the live IST clock's hands: bottom-anchored slivers over the handless
+     face (centre 36.4%/32.3% of the art, radius ~24% of its width) */
+  .clock-hand {
+    position: absolute;
+    left: 20.9%;                    /* painted clock's face on the desk plate */
+    translate: -50% 0;
+    background: #4a3b2a;
+    transform-origin: 50% 100%;
+    border-radius: 45%;
+    pointer-events: none;
+  }
+  .clock-hand--h { width: 0.42%; top: 5.17%; height: 1.03%; }
+  .clock-hand--m { width: 0.32%; top: 4.7%; height: 1.51%; }
+  .clock-cap {
+    left: 20.9%; top: 6.21%;
+    width: 0.7%; aspect-ratio: 1;
+    translate: -50% -50%;
+    border-radius: 50%;
+    background: #6a5230;
+  }
+  .lamp-zone {
+    position: absolute;
+    pointer-events: auto;               /* the .depth wrapper is pointer-transparent */
+    left: 24.5%; top: 1.19%;
+    width: 10%; height: 11.94%;
+    background: transparent;
+    border: 0; padding: 0;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .lamp-zone:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 5px #14161a; }
+  /* the pull chain IS the painted chain: its own pixels sliced from the
+     plate (asset 420,80-452,142), rendered exactly over itself — invisible
+     at rest, the door-knob trick — and stretched on the pull. The earlier
+     decorative bar drew a SECOND string beside the painted one. */
+  .lamp-string {
+    position: absolute;
+    left: 30.24%; top: 6.63%;
+    width: 2.30%; height: auto;
+    transform-origin: 50% 4%;
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  .lamp-string--pull { animation: lampPull 420ms cubic-bezier(.3,.9,.4,1); }
+  @keyframes lampPull {
+    0%   { transform: scaleY(1); }
+    40%  { transform: scaleY(1.45); }
+    70%  { transform: scaleY(0.92); }
+    100% { transform: scaleY(1); }
+  }
+  .chair-spin {
+    position: absolute; bottom: 0;
+    background-image: url('assets/derived/chair-spin.png');
+    background-repeat: no-repeat;
+    pointer-events: none;
+  }
+  /* ── NIGHT ────────────────────────────────────────────────────────────
+     One class on the stage. Plates crossfade (two imgs, opacity), the panes
+     darken through their existing glaze, one indigo veil dims the rest, the
+     lamp pools warm light, and fireflies drift outside the glass. Every
+     moving part is opacity or transform — nothing rasterises per frame. */
+  .art--night { opacity: 0; transition: opacity 1100ms ease; }
+  .night .art--night { opacity: 1; }
+  .night-veil {
+    position: absolute; inset: -2%;
+    background: linear-gradient(200deg, rgb(24 28 66 / .50) 0%, rgb(30 26 58 / .38) 55%, rgb(16 20 48 / .52) 100%);
+    opacity: 0; transition: opacity 1100ms ease;
+    pointer-events: none;
+  }
+  .night .night-veil { opacity: 0.62; }
+  .night .glaze { background: rgb(16 18 48 / .55); transition: background 1100ms ease; }
+  .glaze { transition: background 1100ms ease; }
+  .lamp-glow {
+    position: absolute;
+    width: 340%; aspect-ratio: 1;
+    left: 50%; top: 12%;
+    translate: -50% -50%;
+    background: radial-gradient(circle, rgb(255 214 140 / .7) 0%, rgb(255 196 110 / .36) 30%, rgb(255 180 90 / 0) 65%);
+    opacity: 0; transition: opacity 1100ms ease;
+    pointer-events: none;
+  }
+  /* the pool: warm light ON THE WOOD around the lamp's base, flattened to
+     the desk's perspective — the old giant radial washed the window out and
+     drowned the fireflies (owner's screenshot) */
+  .leg-shadow {
+    position: absolute;
+    width: 8.5%; height: 2%;
+    translate: -50% -30%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, rgb(30 24 16 / .38) 0%, rgb(30 24 16 / .16) 55%, rgb(30 24 16 / 0) 75%);
+    pointer-events: none;
+  }
+  .mug-steam {
+    position: absolute;
+    top: 34.6%;                      /* just above the painted mug's rim */
+    width: 1.6%; height: 4%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, rgb(255 255 250 / .40) 0%, rgb(255 255 250 / 0) 65%);
+    pointer-events: none;
+    animation: steamRise 3.8s ease-in-out infinite;
+    opacity: 0;
+  }
+  @keyframes steamRise {
+    0%   { transform: translateY(0) scale(0.7); opacity: 0; }
+    25%  { opacity: .55; }
+    70%  { opacity: .25; }
+    100% { transform: translateY(-260%) scale(1.25) translateX(30%); opacity: 0; }
+  }
+  .lamp-pool {
+    position: absolute;
+    left: 29.5%; top: 13.5%;
+    width: 30%; height: 12.7%;
+    translate: -50% -50%;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, rgb(255 208 130 / .5) 0%, rgb(255 190 110 / .22) 45%, rgb(255 180 90 / 0) 72%);
+    opacity: 0; transition: opacity 1100ms ease;
+    pointer-events: none;
+  }
+  .night .lamp-pool { opacity: 1; }
+  .night .lamp-glow { opacity: 1; }
+  .firefly {
+    position: absolute;
+    width: 13px; height: 13px; border-radius: 50%;
+    box-shadow: 0 0 10px 2px rgb(255 232 150 / .55);
+    background: radial-gradient(circle, rgb(255 240 170 / .95) 0%, rgb(255 220 120 / .35) 45%, rgb(255 220 120 / 0) 70%);
+    opacity: 0; transition: opacity 1500ms ease;
+    pointer-events: none;
+    animation: fireflyDrift var(--ff-dur, 11s) ease-in-out infinite alternate,
+               fireflyPulse 3.1s ease-in-out infinite;
+    animation-play-state: paused, paused;
+  }
+  .night .firefly { opacity: 1; animation-play-state: running, running; }
+  @keyframes fireflyDrift {
+    0%   { transform: translate(0, 0); }
+    30%  { transform: translate(var(--ff-x1, 26px), var(--ff-y1, -34px)); }
+    65%  { transform: translate(var(--ff-x2, -18px), var(--ff-y2, -12px)); }
+    100% { transform: translate(var(--ff-x3, 12px), var(--ff-y3, -46px)); }
+  }
+  @keyframes fireflyPulse {
+    0%, 100% { filter: none; opacity: .55; }
+    50%      { opacity: 1; }
+  }
+  .prop--spinnable { cursor: pointer; }
+  .prop--spinnable:focus-visible { outline: none; }
+  .prop--spinnable:focus-visible .prop__img {
+    filter: drop-shadow(0 0 0 #fff) drop-shadow(0 0 3px #14161a);
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────
+     HOTSPOTS — siblings of the painted stack, never children of it.
+     §6.5(a): role="img" makes every descendant presentational.
+     ───────────────────────────────────────────────────────────────────── */
+  /* THE OVERLAY THAT ATE EVERY CLICK (found 2026-09-06): this list spans the
+     whole stage ABOVE the props and hit-tested solid — elementFromPoint over
+     the chair returned .hotspots, so no prop ever received a real click (the
+     owner's dead chair/jelly; synthetic-event tests bypassed hit-testing and
+     hid it). The list must be transparent to the pointer; only its buttons
+     are controls. Same for the .depth wrappers below. */
+  .hotspots { position: absolute; inset: 0; margin: 0; padding: 0; list-style: none; pointer-events: none; }
+  .hotspots .hotspot { pointer-events: auto; }
+  .hotspot {
+    position: absolute;
+    /* §6.5(c) — never smaller than 24 rendered CSS px. --k-settled is written
+       once when motion settles, never inside a gesture. */
+    min-width: calc(24px / var(--k-settled, 1));
+    min-height: calc(24px / var(--k-settled, 1));
+    translate: -50% -50%;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    /* A RING, not a blob (owner, 2026-09-04: the wide soft donut read as an
+       orange smudge). A thin bright band hugging the knob with a fast falloff
+       reads as light catching a rim; the centre stays transparent so the
+       painted knob does the acting. */
+    background: radial-gradient(circle,
+      rgb(255 248 228 / 0) 0%, rgb(255 248 228 / 0) 31%,
+      rgb(255 250 234 / .5) 36%, rgb(255 226 150 / .22) 43%,
+      rgb(255 214 130 / .06) 50%, rgb(255 205 100 / 0) 60%);
+    cursor: pointer;
+    animation: knobPulse 3.8s ease-in-out infinite;
+    transition: opacity 300ms ease-out;
+  }
+  .hotspot:hover, .door-knob:hover { animation-play-state: paused; opacity: 1; }
+  .hotspot:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 5px #14161a; }
+
+  /* Breathing, not blinking: small amplitude, slow period, and the scale
+     stays near 1 so the halo never lurches. */
+  @keyframes knobPulse {
+    0%, 100% { opacity: .55; scale: .97; }
+    50%      { opacity: .95; scale: 1.05; }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────
+     DOOR SCENE
+     Paint order: full plate (contains the closed door) -> the warm opening
+     painted over the closed leaf -> a clipped copy of the leaf that swings
+     away and reveals it.
+     ───────────────────────────────────────────────────────────────────── */
+  .door-scene { position: absolute; inset: 0; display: grid; place-items: center; }
+  .door-frame {
+    position: relative;
+    width: min(88vw, calc(88vh * 1354 / 1161));
+    aspect-ratio: 1354 / 1161;
+    transform-origin: 50% 52%;
+  }
+  /* The door-frame box is the ENTRY plate's 1354 x 1161, because every door
+     measurement in this file was taken in that plate's pixel coordinates. The
+     leaf-less plate is 1353 x 1163 and registers onto it at (-1, -1) — found
+     by minimising squared error over a +-6 px search on a ceiling band with no
+     door in it — so it is placed by that offset rather than stretched to fit. */
+  .door-frame > img.plate {
+    position: absolute;
+    left: -0.0739%;                             /* -1 / 1354 */
+    top: -0.0861%;                              /* -1 / 1161 */
+    width: 99.9261%;                            /* 1353 / 1354 */
+    height: auto;
+  }
+  /* The entry window: same lavender sky backstop and the same tree layers as
+     the room, clipped to the aperture measured on the entry plate. Sits under
+     the door-opening in paint order (the leaf swings in front of the wall, and
+     the wall is in front of the glass). */
+  .entry-window {
+    position: absolute; inset: 0;
+    background: linear-gradient(180deg, #d6c2e6 0%, #debad0 52%, #eecad7 100%);
+    /* aperture on the 1354 x 1161 entry frame: TL(924,255) TR(1129,185)
+       BR(1137,929) BL(927,870), flood-filled from a seed in the glass */
+    clip-path: polygon(68.24% 21.96%, 83.38% 15.94%, 83.97% 80.02%, 68.46% 74.94%);
+  }
+  .entry-window .tree-layer { position: absolute; }
+  /* The head and the threshold, and NOT the jambs. The clip is on the WRAPPER,
+     never on the leaf: it must apply AFTER the leaf's transform, and clip-path
+     on a transformed element itself is applied in that element's own space.
+
+     VERIFIED, because it decides the whole technique: a clip-path on this
+     ancestor does NOT flatten the leaf's own perspective. Rendered both cases
+     side by side in headless Chrome — a leaf at perspective(600px)
+     rotateY(-45deg) inside a clip-path parent and inside a plain parent give
+     byte-identical geometry (74.34 x 160 both). Flattening applies to a
+     CHILD's 3D context; here perspective() lives inside the leaf's own
+     transform, so it is self-contained and safe.
+
+     THE BUG THIS PARAGRAPH ONCE WAS: this comment was previously closed one
+     paragraph early, leaving the text below as RAW TEXT in the stylesheet — a
+     parse error that silently dropped the ENTIRE .door-opening rule. No clip
+     existed at all: the leaf passed through the plaster on every swing, the
+     owner reported "it overlaps with the frame" three times, and every
+     verification still was judged for pose rather than occlusion. Found
+     2026-09-06 by diffing a mid-swing frame against the closed frame and
+     asking which pixels changed OUTSIDE the aperture.
+
+     THE FREE-SIDE JAMB IS LOAD-BEARING. The correct inward swing
+     carries the leaf's free stile up to 17.38 px PAST the jamb (plate x 586.3
+     -> 568.92 at 21.17 deg, back by 43.69), and that overhang is physically
+     behind the wall. Without this clip the leaf visibly passes THROUGH the
+     plaster for the first 44 degrees, which is a worse tell than the squash.
+     43.264% = 585.8/1354; the painted leaf's opaque edge renders at 587.96, so
+     2.16 px of clearance and nothing is shaved at rest. The head and threshold
+     percentages are the EXISTING lines re-evaluated at the new left edge —
+     recomputing them is not optional, since keeping the old y values while
+     moving x re-slopes both edges by ~10 px. */
+  .door-opening {
+    position: absolute; inset: 0;
+    clip-path: polygon(43.264% 21.048%, 61.299% 23.489%,
+                       61.299% 77.286%, 43.264% 79.281%);
+  }
+
+  /* THE LEAF. A real cut-out now, so there is no clip-path, no filter and no
+     opacity on it — natural-motion.md §3.5 and diorama-motion.md §4.1 both
+     note that any of those silently flattens a 3D context, and the closed pose
+     below IS a projective transform. The wrapper's clip is safe because the
+     leaf is a leaf: it has no 3D descendants for the flattening to affect.
+
+     Two transforms are composed, and the order matters:
+       matrix(swing) matrix3d(closed)
+     `closed` maps the flat 580 x 1297 elevation onto the trapezoid the leaf
+     actually occupies in the painting (measured; see DOOR in the script), so
+     at rest the leaf is pixel-for-pixel the painted door. `swing` is the exact
+     affine image of a rotation about a vertical hinge under a parallel
+     projection (§3.5) and is the identity at 0°, so composing the two cannot
+     disturb the closed pose. Both act about transform-origin, which sits on
+     the hinge line — the whole line is fixed by the rotation, so only its x
+     matters. 808.5 px of 580 = 139.397%. */
+  .door-leaf {
+    position: absolute;
+    left: 0; top: 0;
+    width: 42.836%;                             /* 580 / 1354 */
+    height: auto;
+    /* The pose is ONE absolute matrix3d in the element's own box, so there is
+       no origin to conjugate by and no transform list to order. 139.397%
+       45.093% was correct when the swing was a separate factor in plate space;
+       with the solved camera it is actively wrong. */
+    transform-origin: 0 0;
+    -webkit-user-drag: none;
+  }
+  /* THE SHADOW AND THE SHADE. The face shading and cast shadow used to be one
+     doorLeafFilter() string rewritten on the leaf every frame; a drop-shadow()
+     whose offset and blur both change defeats the compositor's filter cache,
+     so the whole leaf re-rasterised per frame — measured at ~233 ms of
+     RasterTask inside the 1.4 s swing at DPR 2 (the "door feels laggy" item
+     in DECISIONS §16). Both are now their own <img> whose filter never
+     changes, so they rasterise once and the per-frame writes are transform
+     and opacity only — compositor work, like the props' hover fix. Both start
+     at opacity 0, so the closed pose stays bit-identical to the painting. */
+  .door-shadow {
+    position: absolute;
+    left: 0; top: 0;
+    width: 57.016%;                             /* 772 / 1354 */
+    height: auto;
+    transform-origin: 0 0;
+    opacity: 0;
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  .door-shade {
+    position: absolute;
+    left: 0; top: 0;
+    width: 42.836%;                             /* 580 / 1354, the leaf's box */
+    height: auto;
+    transform-origin: 0 0;
+    opacity: 0;
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  .door-edge {
+    position: absolute;
+    left: 0; top: 0;
+    width: 2.363%;                              /* 32 / 1354 */
+    height: auto;
+    transform-origin: 0 0;
+    opacity: 0;
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  .door-knob-twist {
+    position: absolute;
+    left: 45.077%; top: 50.585%;                /* the knob's rendered centre */
+    width: 2.511%;                              /* 34 / 1354 */
+    height: auto;
+    translate: -50% -50%;
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  /* Centred on the knob the leaf actually carries. The knob's dark pixels in
+     assets/derived/just-door.png have their centroid at (60.4, 657.3), which
+     the closed-pose homography puts at plate (610.3, 587.3) — 45.08% across
+     and 50.59% down the 1354 x 1161 frame. */
+  .door-knob {
+    position: absolute;
+    left: 45.077%; top: 50.585%;
+    width: 7.6%; aspect-ratio: 1;
+    translate: -50% -50%;
+    padding: 0; border: 0; border-radius: 50%;
+    /* Same ring treatment as .hotspot: the painted knob stays visible through
+       the transparent centre (30% of the 44.8px farthest-corner radius keeps
+       a clear hole over the 14.3px knob, with the bright band just outside). */
+    background: radial-gradient(circle,
+      rgb(255 248 228 / 0) 0%, rgb(255 248 228 / 0) 31%,
+      rgb(255 250 234 / .5) 36%, rgb(255 226 150 / .22) 43%,
+      rgb(255 214 130 / .06) 50%, rgb(255 205 100 / 0) 60%);
+    cursor: pointer;
+    animation: knobPulse 3.8s ease-in-out infinite;
+    transition: opacity 300ms ease-out;
+  }
+  .door-knob:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 5px #14161a; }
+
+  /* Overexposure, not a cut to white: a white radial that grows and washes
+     out from the doorway, so the scene blows out rather than being replaced.
+
+     Deliberately NOT mix-blend-mode: screen. This element is inset:-60%, so
+     it covers 2.2x the viewport in each axis, and it animates scale AND
+     opacity for 1.75 s straight over the door art. A blend mode on that makes
+     the compositor read the backdrop back every frame across the whole
+     screen, which is the single most expensive thing in the transition. Over
+     a light scene, white-over-alpha and white-screen are visually all but the
+     same, so this buys the entire cost back for nothing. */
+  .bloom {
+    position: absolute;
+    inset: -60%;
+    pointer-events: none;
+    background: radial-gradient(circle at 50% 49%, #fff 0%, #fff 24%, rgb(255 253 245 / .5) 45%, rgb(255 250 235 / 0) 70%);
+    opacity: 0;
+    transform-origin: 50% 50%;
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────
+     UI CHROME.  No backdrop-filter anywhere: its backdrop is the animating
+     scene, so it would force a readback every frame.
+     ───────────────────────────────────────────────────────────────────── */
+  .ui { position: absolute; right: 12px; bottom: 12px; display: grid; gap: 8px; justify-items: end; }
+  .pad { display: grid; grid-template-columns: repeat(3, 32px); grid-auto-rows: 32px; gap: 4px; }
+  .pad button:nth-child(1) { grid-column: 2; }
+  .row { display: flex; gap: 4px; }
+  .pois { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; max-width: 48vw; }
+
+  /* Scoped to the UI chrome only. An unscoped `button` rule here once painted
+     the door knob solid white on hover — the knob and hotspots are buttons
+     too, and their hover treatment is theirs alone. */
+  .ui button {
+    font: inherit;
+    color: #14161a;
+    background: rgb(255 255 255 / .92);
+    border: 1px solid rgb(20 22 26 / .24);
+    border-radius: 7px;
+    padding: 0 9px;
+    min-height: 26px;
+    cursor: pointer;
+  }
+  .ui button:hover { background: #fff; }
+  button:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff, 0 0 0 4px #14161a; }
+  .pad button { padding: 0; }
+  /* §6.6 — the rubber band is the signal that there is nothing more to see.
+     Under reduced motion the band is gone, so the control has to say it. */
+  button[aria-disabled="true"] { opacity: .42; cursor: default; }
+
+  /* ─────────────────────────────────────────────────────────────────────
+     DEBUG READOUT — toggled with D, visible by default.
+     ───────────────────────────────────────────────────────────────────── */
+  .hud {
+    position: absolute;
+    left: 12px; top: 12px;
+    padding: 8px 10px;
+    background: rgb(255 255 255 / .9);
+    border: 1px solid rgb(20 22 26 / .22);
+    border-radius: 8px;
+    white-space: pre;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .hint {
+    position: absolute;
+    left: 12px; bottom: 12px;
+    max-width: 46ch;
+    padding: 8px 10px;
+    background: rgb(255 255 255 / .8);
+    border: 1px solid rgb(20 22 26 / .16);
+    border-radius: 8px;
+    color: rgb(20 22 26 / .78);
+  }
+
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+  }
+
+  /* §6.6 — reduced motion removes involuntary motion, never the interaction. */
+  @media (prefers-reduced-motion: reduce) {
+    .hotspot, .door-knob { animation: none; opacity: .85; }
+    /* §6.6 — involuntary motion goes, the interaction stays. The wind is
+       involuntary by definition, so every tree layer rests at identity: with
+       no transforms the composition is simply the still painting. */
+    .tree-layer, .seg { transform: none !important; }
+    .prop__img, .prop::before { transition: none; }
+  }
+</style>
+</head>
+
+<body>
+<div id="app">
+
+  <!-- ── ROOM ─────────────────────────────────────────────────────────── -->
+  <div class="viewport" id="viewport" tabindex="0" role="group"
+       aria-label="Diorama room. Drag to pan, scroll or pinch to zoom. Arrow keys pan, plus and minus zoom, 0 resets."
+       hidden>
+    <div class="stage" id="stage">
+
+      <!-- One composite image to assistive tech. §6.5(a) -->
+      <div class="paint" role="img"
+           aria-label="A cutaway model of a small office room on a plinth. A long wooden bench runs under a tall window, holding a clock, a stack of books, a folder, a notebook, an open laptop, a mug of coffee, a stack of photographs, a letter and pen, and an iPod. A swivel chair stands in front of it, a sticky note is stuck to the glass, and a cherry tree in blossom fills the window.">
+
+        <!-- Base plate: the room SHELL only — walls, glass, carpet, plinth.
+             Reference plane, depth factor 1.000. §4.2: splitting the desk out
+             of this plate is the single asset change that decides whether the
+             scene reads as a model or as a sticker. -->
+        <div class="depth" data-z="0">
+          <img class="art" src="assets/room-without-desk.png" alt=""
+               width="1306" height="1205" draggable="false" style="left:0;top:0;width:100%">
+          <img class="art art--night" src="assets/derived/room-night.png" alt=""
+               width="1306" height="1205" draggable="false" style="left:0;top:0;width:100%">
+        </div>
+
+        <!-- Cherry tree seen through the two window apertures. Built by
+             §5's buildWindows() from the WINDOWS table, because the layer's
+             size is derived from the aperture and the layer's own parallax
+             factor rather than hand-tuned. -->
+        <div id="windows"></div>
+
+        <!-- The desk, on its own plate in front of the shell. Placement is
+             solved numerically, never eyeballed: see DESK in the script for the
+             search and its residual. Built by buildDesk() so the one set of
+             fitted numbers drives both the layer and the scale system. -->
+        <div id="desk"></div>
+
+        <!-- Everything that stands in the room. Built by §5's buildProps()
+             from the PROPS table: each object states its real size in
+             centimetres and where it touches the desktop, and its pixel size
+             and position are derived. Nothing here is hand-sized, which is why
+             adding an object is one row and no other change. -->
+        <div id="props"></div>
+      </div>
+
+      <!-- Sibling of the painted stack, so it stays in the accessibility tree. -->
+      <ul class="hotspots">
+        <!-- Centred on the painted knob: its dark pixels' centroid on
+             room-without-desk.png is (365,485) of 1306x1205 = 27.95%, 40.23%.
+             .hotspot carries translate(-50%,-50%), so left/top ARE the centre. -->
+        <li><button class="hotspot" id="exitKnob" type="button" data-nodrag
+                    style="left:27.95%;top:40.23%;width:4.6%;aspect-ratio:1">
+          <span class="sr-only">Leave the room and return to the door</span>
+        </button></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ── DOOR ─────────────────────────────────────────────────────────── -->
+  <div class="door-scene" id="doorScene">
+    <div class="door-frame" id="doorFrame">
+      <!-- entry-base.png is a composite built offline (tools: see FIX-BRIEF):
+           the doorless plate (without-door.png, so the corridor beyond is
+           already painted and simply gets uncovered as the leaf swings off it)
+           with the tree-free plate's EMPTY glass patched into the window, so
+           the swaying branch stack can be composed behind the glass here just
+           as it is inside the room. One plate, one leaf, one tree stack. -->
+      <img class="plate" src="assets/entry-base.png"
+           alt="A cutaway model of a small entryway on a plinth: a wooden door with a dark knob, a corridor beyond, and a cherry tree in blossom through the window."
+           width="1353" height="1163" draggable="false">
+
+      <!-- The window, with the same tree composition as the room's panes.
+           Filled by buildEntryWindow(); the aperture polygon is measured off
+           entry-no-tree.png by flood-filling the glass from a seed inside it. -->
+      <div class="entry-window" id="entryWindow"></div>
+
+      <!-- The leaf, inside the opening it can never leave. Its closed pose is a
+           measured projective placement written by measureDoor(); the swing
+           multiplies an affine on top of it. -->
+      <div class="door-opening">
+        <!-- The cast shadow, pre-blurred offline (tools/bake-door-shadow.py),
+             clipped by the aperture; only shown for INWARD test poses. -->
+        <img class="door-shadow" id="doorShadow" src="assets/derived/door-shadow.png" alt=""
+             width="772" height="1489" draggable="false">
+      </div>
+      <!-- The leaf and companions sit OUTSIDE the clip since the swing went
+           OUTWARD (2026-09-06): a door opening toward the viewer swings in
+           FRONT of the wall, so the frame must not cut it. At rest the pose
+           is pixel-identical to the painting either way. Edge slab first:
+           when the projection folds it behind the face, the leaf paints over
+           it. Shade last: a black baked copy at opacity (1 - b) equals
+           brightness(b), rasterised once. -->
+      <img class="door-edge" id="doorEdge" src="assets/derived/door-edge.png" alt=""
+           width="32" height="1293" draggable="false">
+      <img class="door-leaf" id="doorLeaf" src="assets/derived/just-door.png" alt=""
+           width="580" height="1297" draggable="false">
+      <img class="door-shade" id="doorShade" src="assets/derived/door-shade.png" alt=""
+           width="580" height="1297" draggable="false">
+
+      <!-- The knob, again, as a screen-aligned disc sliced from the plate at
+           its rendered position — identical pixels over the painted knob, so
+           invisible at rest. Rotating it during the knob beat sweeps the
+           painted highlight: the twist the owner asked for. Hidden the moment
+           the leaf starts moving, with the halo. -->
+      <img class="door-knob-twist" id="knobTwist" src="assets/derived/door-knob.png" alt=""
+           width="34" height="34" draggable="false">
+      <button class="door-knob" id="enterKnob" type="button">
+        <span class="sr-only">Open the door and enter the room</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="bloom" id="bloom"></div>
+
+  <!-- ── CHROME ───────────────────────────────────────────────────────── -->
+  <!-- §6.5(b) WCAG SC 2.5.7: drag-to-pan is a failure without a
+       single-pointer alternative. These are it. -->
+  <div class="ui" id="ui" hidden>
+    <div class="pois" id="pois"></div>
+    <div class="row">
+      <button type="button" data-cmd="zoom-out" id="btnOut" aria-label="Zoom out">&minus;</button>
+      <button type="button" data-cmd="zoom-in" id="btnIn" aria-label="Zoom in">+</button>
+      <button type="button" data-cmd="home">reset</button>
+      <button type="button" data-cmd="exit">door</button>
+    </div>
+    <div class="pad">
+      <button type="button" data-cmd="up" aria-label="Pan up">&uarr;</button>
+      <button type="button" data-cmd="left" aria-label="Pan left">&larr;</button>
+      <button type="button" data-cmd="down" aria-label="Pan down">&darr;</button>
+      <button type="button" data-cmd="right" aria-label="Pan right">&rarr;</button>
+    </div>
+  </div>
+
+  <div class="hud" id="hud"></div>
+  <div class="hint" id="hint" hidden>drag to pan &middot; wheel or pinch to zoom &middot; arrows, + &minus; 0 &middot; D toggles this readout</div>
+  <p class="sr-only" aria-live="polite" id="live"></p>
+</div>
+
+<script>
+'use strict';
+
+/* ══════════════════════════════════════════════════════════════════════
+   §1  MATHS — pure, stateless, frame-rate independent.
+   ══════════════════════════════════════════════════════════════════════ */
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+/** ω₀ from Apple's "response" parameterisation: ω₀ = 2π / response. §2.2 */
+const omegaFromResponse = (r) => (2 * Math.PI) / r;
+
+/**
+ * Exact closed-form step of the damped harmonic oscillator. §2.2
+ *
+ * NOT semi-implicit Euler. Euler drifts with refresh rate — the report
+ * measures 99.6004 at 60 Hz against 99.8032 at 240 Hz for the same
+ * integration — which would make the scene feel materially different on a
+ * 120 Hz display. The closed form is composable, step(a) then step(b) ===
+ * step(a+b), so it is frame-rate independent by construction.
+ *
+ * Mutates `s` in place: this runs every frame and must not allocate.
+ */
+function stepSpring(s, target, w0, zeta, dt) {
+  const d = s.x - target;
+  if (zeta < 1) {                                   // underdamped: one soft overshoot
+    const w = w0 * Math.sqrt(1 - zeta * zeta);
+    const e = Math.exp(-zeta * w0 * dt);
+    const cs = Math.cos(w * dt);
+    const sn = Math.sin(w * dt);
+    const A = (s.v + zeta * w0 * d) / w;
+    const pos = d * cs + A * sn;
+    s.x = target + e * pos;
+    s.v = e * (-zeta * w0 * pos + (A * w * cs - d * w * sn));
+    return s;
+  }
+  const e = Math.exp(-w0 * dt);                     // critically damped: never overshoots
+  s.x = target + e * (d + (s.v + w0 * d) * dt);
+  s.v = e * (s.v - w0 * dt * (s.v + w0 * d));
+  return s;
+}
+
+/**
+ * Apple's UIScrollView resistance curve. §2.4
+ *   f(x) = (x·d·c) / (d + c·x),   c = 0.55 on iOS
+ * Monotonic, and asymptotes to `give` however hard you pull. That asymptote
+ * is the physical signal: progressively harder, visibly refusing.
+ */
+const rubberband = (overshoot, give, c) => (overshoot * give * c) / (give + c * overshoot);
+
+/** Project a raw value into [min,max] with soft resistance outside. §2.4 */
+function bandTo(v, min, max, give, c) {
+  if (max < min) { const mid = (min + max) / 2; min = mid; max = mid; }
+  if (give <= 0 || c <= 0) return clamp(v, min, max);   // reduced motion degenerates to a hard clamp
+  if (v < min) return min - rubberband(min - v, give, c);
+  if (v > max) return max + rubberband(v - max, give, c);
+  return v;
+}
+
+/**
+ * Zoom by `dz` log-units keeping the viewport point (px,py) pinned. §2.1
+ *
+ *   w = (p − t)/k   and   w·k′ + t′ = p    ⟹    t′ = p − (p − t)·(k′/k)
+ *   and k′/k = e^dz, so k drops out of the anchoring step entirely.
+ *
+ * Working in z = ln(scale) also removes the zoom-in/zoom-out asymmetry:
+ * exp(+dz)·exp(−dz) === 1 exactly.
+ */
+function zoomAbout(cam, px, py, dz) {
+  const s = Math.exp(dz);
+  cam.z += dz;
+  cam.x = px - (px - cam.x) * s;
+  cam.y = py - (py - cam.y) * s;
+  return cam;
+}
+
+/** Pan limits at a given zoom; centres the stage when it is smaller than the view. §2.1 */
+function panBounds(world, view, z, margin) {
+  const k = Math.exp(z);
+  const axis = (content, viewport) =>
+    content + 2 * margin >= viewport
+      ? { min: viewport - content - margin, max: margin }
+      : { min: (viewport - content) / 2, max: (viewport - content) / 2 };
+  return { x: axis(world.w * k, view.w), y: axis(world.h * k, view.h) };
+}
+
+/* Wheel normalisation. §2.6 — there is no cross-browser meaning to a delta;
+   the spec itself says authors cannot assume one. */
+const LINE_PX = 16;
+const PAGE_PX = 400;
+const PINCH_GAIN = 2.2;
+const WHEEL_NOTCH = 0.16;      // ln-units per detent ≈ 17% per click
+
+function normalizeWheel(e) {
+  let dx = e.deltaX, dy = e.deltaY;
+  if (dx === 0 && e.shiftKey) { dx = dy; dy = 0; }                // horizontal wheel arrives as shift+deltaY
+  if (e.deltaMode === 1) { dx *= LINE_PX; dy *= LINE_PX; }        // DOM_DELTA_LINE
+  else if (e.deltaMode === 2) { dx *= PAGE_PX; dy *= PAGE_PX; }   // DOM_DELTA_PAGE
+  return { dx: dx, dy: dy };
+}
+
+/** Pinch → log-scale delta. Symmetric by construction: dz(+d) + dz(−d) === 0. */
+function dzFromPinch(dyNorm, gain) {
+  const g = gain === undefined ? PINCH_GAIN : gain;
+  const dy = Math.sign(dyNorm) * Math.min(24, Math.abs(dyNorm));  // Burzo's clamp
+  return -Math.sign(dy) * Math.log(1 + Math.abs((g * dy) / 100));
+}
+
+/** Mouse wheel → log-scale delta. Magnitude deliberately discarded. §2.6 */
+const dzFromNotch = (dyNorm) => -Math.sign(dyNorm) * WHEEL_NOTCH;
+
+/** Apparent scale of a flat plane at notional depth z under perspective P. §4.1 */
+const depthFactor = (z, P) => P / (P - z);
+
+const DioramaMath = Object.freeze({
+  clamp, omegaFromResponse, stepSpring, rubberband, bandTo,
+  zoomAbout, panBounds, normalizeWheel, dzFromPinch, dzFromNotch, depthFactor
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   §2  VELOCITY TRACKER — §2.9
+       Sliding first-vs-last window over ~100 ms. A last-frame delta is far
+       too noisy: one 8 ms frame with 1 px of jitter reads as 125 px/s.
+   ══════════════════════════════════════════════════════════════════════ */
+function createVelocityTracker(windowMs) {
+  const s = [];
+  return {
+    reset() { s.length = 0; },
+    add(t, x, y) {
+      s.push({ t: t, x: x, y: y });
+      const cut = t - windowMs;
+      while (s.length > 2 && s[0].t < cut) s.shift();
+    },
+    get() {
+      const n = s.length;
+      if (n < 2) return { vx: 0, vy: 0 };
+      const a = s[0], b = s[n - 1];
+      const dt = (b.t - a.t) / 1000;
+      if (dt <= 1e-4) return { vx: 0, vy: 0 };
+      return { vx: (b.x - a.x) / dt, vy: (b.y - a.y) / dt };
+    }
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §3  WHEEL DEVICE HEURISTIC — §2.6
+       Flagged UNVERIFIED in the report: no API reports the input device and
+       these weights are untested on hardware. What makes a misclassification
+       survivable rather than fatal ships alongside it — visible +/−
+       buttons, keyboard zoom, and ctrl/cmd+wheel as an explicit override.
+   ══════════════════════════════════════════════════════════════════════ */
+function createWheelClassifier() {
+  let mode = null;
+  let last = 0;
+  return function classify(e, now) {
+    if (now - last > 500) mode = null;              // latch, so one misread cannot flip mid-gesture
+    last = now;
+    if (mode) return mode;
+    const ay = Math.abs(e.deltaY);
+    let score = 0;                                  // + = wheel, − = trackpad
+    if (e.deltaMode !== 0) score += 3;              // strongest signal
+    if (!Number.isInteger(e.deltaY)) score -= 3;
+    if (e.deltaX !== 0) score -= 1;
+    if (e.deltaMode === 0 && ay >= 40 && ay % 20 === 0) score += 2;
+    if (e.deltaMode === 0 && ay > 0 && ay < 12) score -= 1;
+    mode = score >= 1 ? 'wheel' : 'trackpad';
+    return mode;
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §4  CAMERA + PHYSICS — the whole of the "silky".
+
+       No DOM, no rAF, no performance.now(). Every entry point takes the
+       clock as an argument and `step(dt, now)` advances one frame, so a
+       harness can run it deterministically at any refresh rate.
+
+       THE ANCHOR RULE. `anchor` is the viewport point the zoom holds fixed,
+       and stepZoom() re-applies it on every frame the z spring moves — for
+       whatever reason it moves. So there must be no way to disturb z
+       without naming the anchor in the same call. Every public method that
+       can move z (zoomBy, zoomTo, flyTo, home, setViewport) sets it. That
+       is not decoration: the bug this prototype was written to catch was a
+       zoom that sprang about a stale anchor left over from a previous
+       gesture, which drags the whole room sideways as it settles.
+   ══════════════════════════════════════════════════════════════════════ */
+function createCamera(options) {
+  const world = options.world;
+  const pois = options.pois;
+
+  /* Everything here except bandC and Apple's 0.55 is a judgement number the
+     report explicitly refuses to source. These are the hand-tuning knobs. */
+  const cfg = {
+    homeFill: 0.88,                       // fraction of the viewport the room fills at home
+    /* Scene-supplied framing. The physics does not care where home is; the
+       composition does, and it is the composition that knows the objects are
+       small. Defaults reproduce the whole-room-centred behaviour exactly. */
+    homeBoost: 1,                         // home is this much closer than that fit
+    homeFocus: null,                      // { x, y } world point held at the centre
+    zOutLog: Math.log(1.3),               // how much wider than home you may pull
+    zInLog: Math.log(4.2),                // how much closer than home you may push
+    w0Track: omegaFromResponse(0.15),     // tracking a live discrete input
+    w0Settle: omegaFromResponse(0.42),    // settling, and the return from a limit
+    w0Fly: omegaFromResponse(0.55),       // magnetic settle onto a point of interest
+    zetaBounce: 0.86,                     // ζ<1 ONLY when returning from past a limit
+    panGive: 0,                           // set by setViewport(): 18% of the short side
+    zGive: Math.log(1.6),                 // never more than 60% past a zoom limit, §2.5
+    bandC: 0.55,                          // Apple's constant
+    tau: 0.26,                            // momentum time constant, §2.10
+    momentum: true,
+    idleMs: 110,                          // "the user stopped" threshold, §2.5
+    minFling: 60,                         // px/s below which we do not glide at all
+    restPx: 0.5,                          // Motion's own inertia restDelta
+    restZ: 0.0008,
+    /* A spring approaches its target asymptotically and never arrives, so
+       without an explicit rest test the camera keeps emitting new — visually
+       identical — transform strings forever, and §3.3's raster hand-back never
+       fires: will-change stays pinned ON, which is the exact failure mode that
+       makes zoomed art go soft. So snap to the target once the remaining error
+       is below what the rendered transform can express. The stage writes
+       translate to 2 dp and scale to 5 dp, so 0.004 px and 2e-6 log units
+       (< 1e-5 of k at this scene's maximum k) are both under the last digit. */
+    snapPx: 0.004,
+    snapVpx: 0.4,
+    snapZ: 2e-6,
+    snapVz: 2e-4,
+    magDz: Math.log(1.28),                // magnet capture radius, log-scale units
+    magDs: 0.14,                          // magnet capture radius, fraction of short side
+    magRearm: 1.6                         // hysteresis, so a snap cannot re-fire instantly
+  };
+
+  /** The rendered camera. z = ln(scale). §2.1 */
+  const cam = { x: 0, y: 0, z: 0 };
+  const view = { w: 1, h: 1 };
+  const limits = { zMin: 0, zMax: 0, zHome: 0 };
+  const anchor = { x: 0, y: 0 };
+
+  /** One smoothed axis: a raw intent that may run past the limits, plus the
+      spring state actually rendered. Band the OUTPUT, never the state (§2.4) —
+      banding the stored value makes a reversal feel dead for the first pixels. */
+  const makeAxis = () => ({ intent: 0, s: { x: 0, v: 0 }, bounce: false });
+  const axX = makeAxis();
+  const axY = makeAxis();
+  const axZ = makeAxis();
+
+  let glide = null;                     // { vx, vy } px/s
+  let dragging = false;
+  let directZoom = false;               // touch pinch: direct manipulation, so no smoothing
+  let magnet = null;                    // { poi }
+  let magnetArmed = false;
+  let interacted = false;
+  let reduce = false;
+  let lastPanInput = -1e9;
+  let lastZoomInput = -1e9;
+  let sized = false;
+
+  const setAnchor = (px, py) => { anchor.x = px; anchor.y = py; };
+
+  /* ── framing ──────────────────────────────────────────────────────── */
+
+  /**
+   * Resize. The limits are derived from the viewport, so a resize can move
+   * the z spring's target on its own — which is exactly the situation the
+   * anchor rule exists for. Re-anchor to the new centre, rebase z by the
+   * shift in zHome, and re-solve the pan so the world point that was
+   * centred stays centred. Nothing springs; a resize is not an animation.
+   */
+  function setViewport(w, h) {
+    const kOld = Math.exp(cam.z);
+    const cx = sized ? (view.w * 0.5 - cam.x) / kOld : world.w / 2;
+    const cy = sized ? (view.h * 0.5 - cam.y) / kOld : world.h / 2;
+    const zHomeOld = limits.zHome;
+
+    view.w = w;
+    view.h = h;
+    const fit = Math.min(w * cfg.homeFill / world.w, h * cfg.homeFill / world.h);
+    limits.zHome = Math.log(fit * cfg.homeBoost);
+    limits.zMin = limits.zHome - cfg.zOutLog;
+    limits.zMax = limits.zHome + cfg.zInLog;
+    cfg.panGive = reduce ? 0 : Math.min(w, h) * 0.18;
+    setAnchor(w * 0.5, h * 0.5);
+
+    if (!sized) { sized = true; home(0); return; }
+    if (!interacted) { home(0); return; }
+
+    const z = clamp(axZ.s.x + (limits.zHome - zHomeOld), limits.zMin, limits.zMax);
+    const k = Math.exp(z);
+    setAll(w * 0.5 - cx * k, h * 0.5 - cy * k, z);
+  }
+
+  /** Snap every axis — intent, spring position, spring velocity — to one pose. */
+  function setAll(x, y, z) {
+    axZ.intent = z; axZ.s.x = z; axZ.s.v = 0; axZ.bounce = false;
+    axX.intent = x; axX.s.x = x; axX.s.v = 0; axX.bounce = false;
+    axY.intent = y; axY.s.x = y; axY.s.v = 0; axY.bounce = false;
+    cam.x = x; cam.y = y; cam.z = z;
+    glide = null;
+    magnet = null;
+    magnetArmed = false;
+  }
+
+  /**
+   * Frame the whole room. A non-zero `zOffsetLog` starts the camera that
+   * much closer and leaves the z spring pointed at home, so the room
+   * resolves outward — which is how the door transition lands.
+   */
+  function home(zOffsetLog) {
+    const z = clamp(limits.zHome + (zOffsetLog || 0), limits.zMin, limits.zMax);
+    const k = Math.exp(z);
+    const fx = cfg.homeFocus ? cfg.homeFocus.x : world.w / 2;
+    const fy = cfg.homeFocus ? cfg.homeFocus.y : world.h / 2;
+    // Clamp to the legal pan region, or the first frame springs back off a pose
+    // that was never reachable. A world-centred home is always inside it, so
+    // this changes nothing for the default framing.
+    const b = panBounds(world, view, z, 0);
+    setAll(clamp(view.w * 0.5 - fx * k, b.x.min, b.x.max),
+           clamp(view.h * 0.5 - fy * k, b.y.min, b.y.max), z);
+    axZ.intent = limits.zHome;          // the residual z the spring will unwind
+    setAnchor(view.w * 0.5, view.h * 0.5);
+  }
+
+  /**
+   * The cursor anchor moves the translation, so every quantity living in
+   * translation space must move with it under the same affine map, or intent,
+   * rendered position and velocity drift apart. §2.5
+   */
+  function applyAnchor(px, py, dz) {
+    const s = Math.exp(dz);
+    zoomAbout(cam, px, py, dz);
+    axX.intent = px - (px - axX.intent) * s;
+    axY.intent = py - (py - axY.intent) * s;
+    axX.s.x = px - (px - axX.s.x) * s;
+    axY.s.x = py - (py - axY.s.x) * s;
+    axX.s.v *= s;                                     // an affine map scales velocity by s
+    axY.s.v *= s;
+    if (glide) { glide.vx *= s; glide.vy *= s; }
+  }
+
+  /* ── momentum ─────────────────────────────────────────────────────── */
+
+  /**
+   * §2.10 — amplitude = v₀·τ, NOT the widely-copied 0.8·v₀.
+   * With x(t) = target − A·e^(−t/τ) the initial speed is A/τ, so A = 0.8·v₀ at
+   * τ = 0.325 launches at 2.46× the release velocity: a visible kick on every
+   * flick. A = v₀·τ starts at exactly v₀, which is C1-continuous with the drag.
+   */
+  function stepMomentum(dt) {
+    if (!glide) return;
+    const decay = Math.exp(-dt / cfg.tau);            // exact integration of v′ = −v/τ
+    axX.intent += glide.vx * cfg.tau * (1 - decay);
+    axY.intent += glide.vy * cfg.tau * (1 - decay);
+    glide.vx *= decay;
+    glide.vy *= decay;
+
+    // Hand off to the settle spring on leaving the legal region, seeded with the
+    // glide velocity at that instant, so glide → bounce reads as one motion and
+    // not as two animations stitched together.
+    const b = panBounds(world, view, cam.z, 0);
+    if (glide.vx !== 0 && (axX.intent < b.x.min || axX.intent > b.x.max)) { axX.s.v = glide.vx; glide.vx = 0; }
+    if (glide.vy !== 0 && (axY.intent < b.y.min || axY.intent > b.y.max)) { axY.s.v = glide.vy; glide.vy = 0; }
+
+    if (glide.vx === 0 && glide.vy === 0) { glide = null; return; }
+    if (Math.abs(glide.vx * cfg.tau) < cfg.restPx &&
+        Math.abs(glide.vy * cfg.tau) < cfg.restPx) glide = null;
+  }
+
+  /* ── one axis of the pan ──────────────────────────────────────────── */
+  function stepPanAxis(a, min, max, live, direct, dt) {
+    let target;
+    if (live) {
+      target = bandTo(a.intent, min, max, cfg.panGive, cfg.bandC);
+    } else {
+      const c = clamp(a.intent, min, max);
+      if (c !== a.intent) { a.intent = c; a.bounce = cfg.panGive > 0; }  // release the stretch
+      target = c;
+    }
+    if (direct) {
+      // Direct manipulation is NEVER smoothed (§2.3). Rendered === banded intent,
+      // and the spring's velocity is kept warm for the release handoff.
+      a.s.v = (target - a.s.x) / dt;
+      a.s.x = target;
+      return;
+    }
+    stepSpring(a.s, target, live ? cfg.w0Track : cfg.w0Settle,
+               a.bounce ? cfg.zetaBounce : 1, dt);
+    if (a.bounce && Math.abs(a.s.x - target) < cfg.restPx && Math.abs(a.s.v) < 8) a.bounce = false;
+    if (!live && Math.abs(a.s.x - target) < cfg.snapPx && Math.abs(a.s.v) < cfg.snapVpx) {
+      a.s.x = target; a.s.v = 0;                      // arrive, so the loop can go quiet
+    }
+  }
+
+  /* ── zoom ─────────────────────────────────────────────────────────── */
+  function stepZoom(dt, now) {
+    const live = directZoom || (now - lastZoomInput < cfg.idleMs);
+    let target;
+
+    if (live) {
+      target = bandTo(axZ.intent, limits.zMin, limits.zMax, cfg.zGive, cfg.bandC);
+    } else {
+      const c = clamp(axZ.intent, limits.zMin, limits.zMax);
+      if (c !== axZ.intent) { axZ.intent = c; axZ.bounce = cfg.zGive > 0; }
+      target = c;
+    }
+
+    const prev = axZ.s.x;
+    if (directZoom) {
+      axZ.s.v = (target - axZ.s.x) / dt;
+      axZ.s.x = target;
+    } else {
+      // Switching ω₀ and ζ between live and settling is a discontinuity in the
+      // parameters, not the state: position and velocity carry across untouched.
+      const w0 = magnet ? cfg.w0Fly : (live ? cfg.w0Track : cfg.w0Settle);
+      stepSpring(axZ.s, target, w0, axZ.bounce ? cfg.zetaBounce : 1, dt);
+      if (axZ.bounce && Math.abs(axZ.s.x - target) < cfg.restZ && Math.abs(axZ.s.v) < 0.02) {
+        axZ.bounce = false;
+      }
+      if (!live && !magnet && Math.abs(axZ.s.x - target) < cfg.snapZ && Math.abs(axZ.s.v) < cfg.snapVz) {
+        axZ.s.x = target; axZ.s.v = 0;
+      }
+    }
+
+    // Re-apply the cursor anchor with the RENDERED delta, not the raw one. §2.5
+    const dz = axZ.s.x - prev;
+    if (dz !== 0) applyAnchor(anchor.x, anchor.y, dz);
+    else cam.z = axZ.s.x;
+  }
+
+  /* ── magnetic settle ──────────────────────────────────────────────── */
+  function poiTargetZ(poi) {
+    const k = Math.min(view.w / (poi.w * 1.22), view.h / (poi.h * 1.22));
+    return clamp(Math.log(k), limits.zMin, limits.zMax);
+  }
+
+  /** Normalised distance from the current camera to a POI's composed framing. */
+  function poiScore(poi) {
+    const k = Math.exp(cam.z);
+    const sx = cam.x + poi.x * k;                     // the POI's current screen position
+    const sy = cam.y + poi.y * k;
+    const dz = (cam.z - poiTargetZ(poi)) / cfg.magDz;
+    const ds = Math.hypot(sx - view.w * 0.5, sy - view.h * 0.5) /
+               (Math.min(view.w, view.h) * cfg.magDs);
+    return Math.hypot(dz, ds);
+  }
+
+  function considerMagnet(now) {
+    if (dragging || glide || magnet || !interacted) return;
+    if (now - lastPanInput < 140 || now - lastZoomInput < 140) return;
+
+    let best = null, bestScore = Infinity;
+    for (let i = 0; i < pois.length; i++) {
+      const sc = poiScore(pois[i]);
+      if (sc < bestScore) { bestScore = sc; best = pois[i]; }
+    }
+    if (!magnetArmed) { if (bestScore > cfg.magRearm) magnetArmed = true; return; }
+    if (bestScore <= 1) { magnet = { poi: best }; magnetArmed = false; }
+  }
+
+  /**
+   * While the magnet converges, the zoom anchor is the POI itself. The anchored
+   * zoom then pins the object on screen and the pan spring only has to slide it
+   * to centre — the two become orthogonal instead of fighting each other.
+   */
+  function prepMagnet() {
+    const k = Math.exp(cam.z);
+    setAnchor(cam.x + magnet.poi.x * k, cam.y + magnet.poi.y * k);
+    axZ.intent = poiTargetZ(magnet.poi);
+  }
+
+  function stepMagnetPan(dt) {
+    const k = Math.exp(cam.z);
+    const tx = view.w * 0.5 - magnet.poi.x * k;       // recomputed from the CURRENT k
+    const ty = view.h * 0.5 - magnet.poi.y * k;
+    stepSpring(axX.s, tx, cfg.w0Fly, 1, dt);
+    stepSpring(axY.s, ty, cfg.w0Fly, 1, dt);
+    axX.intent = axX.s.x;
+    axY.intent = axY.s.x;
+
+    if (Math.abs(axZ.s.x - axZ.intent) < cfg.restZ &&
+        Math.abs(axX.s.x - tx) < cfg.restPx &&
+        Math.abs(axY.s.x - ty) < cfg.restPx) magnet = null;
+  }
+
+  /* ── the frame ────────────────────────────────────────────────────── */
+  function step(dt, now) {
+    if (magnet) prepMagnet();
+    stepMomentum(dt);
+    stepZoom(dt, now);
+
+    if (magnet) {
+      stepMagnetPan(dt);
+    } else {
+      // Bounds depend on z, so they move under the band during a simultaneous
+      // zoom-and-pan. Recompute every frame: six arithmetic operations. §2.4
+      const b = panBounds(world, view, cam.z, 0);
+      const glideX = !!glide && glide.vx !== 0;
+      const glideY = !!glide && glide.vy !== 0;
+      const recent = now - lastPanInput < cfg.idleMs;
+      stepPanAxis(axX, b.x.min, b.x.max, dragging || glideX || recent, dragging || glideX, dt);
+      stepPanAxis(axY, b.y.min, b.y.max, dragging || glideY || recent, dragging || glideY, dt);
+    }
+
+    cam.x = axX.s.x;
+    cam.y = axY.s.x;
+    considerMagnet(now);
+  }
+
+  /* ── public input surface ─────────────────────────────────────────── */
+  function cancelMotion() { glide = null; magnet = null; }
+
+  function panBy(dx, dy, now) {
+    cancelMotion();
+    interacted = true;
+    axX.intent += dx;
+    axY.intent += dy;
+    lastPanInput = now;
+  }
+
+  /** Smoothed zoom by a log delta, held about (px,py). Wheel, keyboard, buttons. */
+  function zoomBy(dz, px, py, now) {
+    cancelMotion();
+    interacted = true;
+    setAnchor(px, py);
+    axZ.intent += dz;                                 // may exceed the limits — that is the point
+    lastZoomInput = now;
+  }
+
+  /** Absolute zoom, held about (px,py). Pinch: direct, so never smoothed. */
+  function zoomTo(z, px, py, now) {
+    interacted = true;
+    setAnchor(px, py);
+    axZ.intent = z;
+    lastZoomInput = now;
+  }
+
+  function beginDrag(now) {
+    cancelMotion();                                   // an interrupting grab kills the glide
+    interacted = true;
+    dragging = true;
+    lastPanInput = now;
+  }
+
+  function dragBy(dx, dy, now) {
+    axX.intent += dx;                                 // 1:1, zero smoothing
+    axY.intent += dy;
+    lastPanInput = now;
+  }
+
+  function endDrag(vx, vy, now) {
+    dragging = false;
+    glide = (!cfg.momentum || Math.hypot(vx, vy) < cfg.minFling) ? null : { vx: vx, vy: vy };
+    lastPanInput = now;
+  }
+
+  function beginPinch(now) { cancelMotion(); interacted = true; dragging = false; directZoom = true; lastZoomInput = now; }
+  function endPinch(now) { directZoom = false; lastZoomInput = now; }
+  function resumeDrag(now) { dragging = true; lastPanInput = now; }
+
+  function flyTo(poi) {
+    interacted = true;
+    glide = null;
+    magnet = { poi: poi };
+    magnetArmed = false;
+    prepMagnet();                                     // names the anchor before z can move
+  }
+
+  function setReducedMotion(off) {
+    reduce = off;
+    // One code path: the time constants collapse and `give` goes to zero,
+    // which turns bandTo into a hard clamp. §6.6
+    cfg.w0Track = omegaFromResponse(off ? 0.001 : 0.15);
+    cfg.w0Settle = omegaFromResponse(off ? 0.001 : 0.42);
+    cfg.w0Fly = omegaFromResponse(off ? 0.001 : 0.55);
+    cfg.zGive = off ? 0 : Math.log(1.6);
+    cfg.momentum = !off;
+    cfg.panGive = off ? 0 : Math.min(view.w, view.h) * 0.18;
+  }
+
+  /** '' | 'min' | 'max' — drives the aria-live text and the +/− button states. */
+  function zoomLimitState() {
+    if (axZ.s.x >= limits.zMax - 1e-3) return 'max';
+    if (axZ.s.x <= limits.zMin + 1e-3) return 'min';
+    return '';
+  }
+
+  /** True while anything could still move, including a held-still drag. The
+      velocity terms are exact comparisons because the springs snap to rest. */
+  function isBusy(now) {
+    return dragging || directZoom || !!glide || !!magnet ||
+           now - lastPanInput < cfg.idleMs || now - lastZoomInput < cfg.idleMs ||
+           axZ.s.v !== 0 || axX.s.v !== 0 || axY.s.v !== 0;
+  }
+
+  function mode(now) {
+    if (dragging) return 'drag';
+    if (directZoom) return 'pinch';
+    if (glide) return 'glide';
+    if (magnet) return 'magnet:' + magnet.poi.id;
+    if (now - lastPanInput < cfg.idleMs || now - lastZoomInput < cfg.idleMs) return 'input';
+    if (axZ.bounce || axX.bounce || axY.bounce) return 'bounce';
+    return 'rest';
+  }
+
+  return {
+    cam: cam, view: view, limits: limits, cfg: cfg, anchor: anchor,
+    setViewport, setReducedMotion, home, step,
+    panBy, zoomBy, zoomTo, beginDrag, dragBy, endDrag,
+    beginPinch, endPinch, resumeDrag, flyTo, cancelMotion,
+    zoomLimitState, isBusy, mode
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §5  SCENE DATA — this file's artwork. The camera above never sees it.
+   ══════════════════════════════════════════════════════════════════════ */
+
+const WORLD = { w: 1306, h: 1205 };                 // base plate natural size == .stage box
+
+/* §4.1 — layers are authored as notional depths in data-z and converted once
+   to the constant pan multiplier s = P/(P − z):
+     tree, both windows  z = −1200   s = 0.600
+     room shell          z =     0   s = 1.000   (reference plane)
+     sticky note (glass) z =     0   s = 1.000   stuck to the pane, so no slide
+     desk                z =  +130   s = 1.078
+     everything ON the desk           s = 1.078  — SAME layer as the desk
+     chair               z =  +200   s = 1.125
+   Two deliberate choices here, both answering "everything looks out of place":
+
+   (a) Every desktop object shares the desk's depth EXACTLY. Give a mug even a
+       slightly different multiplier and it slides across the wood as you pan,
+       which reads as the object floating; correctness of contact is worth more
+       than a few extra pixels of parallax on a 4 cm object.
+   (b) Both apertures show the SAME tree, so both get the same depth. They had
+       −1800 and −1200, which pulled one copy of one tree in two directions.
+   Spread is now 0.60 … 1.125, about 1.9x, down from 2.3x. */
+const PERSPECTIVE = 1800;
+
+/* ══════════════════════════════════════════════════════════════════════
+   SCALE SYSTEM — ONE source of truth for how big anything is.
+
+   Every object states its real-world size in centimetres. Its pixel size is
+   derived. No object is ever hand-tuned to "look about right", because that
+   is how the clock ended up 46 cm tall.
+
+   THE ANCHOR IS THE DESK, MEASURED VERTICALLY.
+   In assets/desk-only.png (1107 x 809) the back-left leg stands at x = 70.
+   Care: at x = 70 the top face's BACK edge is at y = 101, but the leg is at
+   the FRONT of the desk. The work surface directly above the leg is the front
+   edge at y = 168 (column dump: bright top face 101..167, front-edge highlight
+   at 167, slab face 169..191, leg 193..377). Foot at y ≈ 378, so the 73 cm
+   stand-off is 210 source px, not 270 — the audit caught the back-edge misread
+   inflating the vertical scale by 28.6%. The desk plate is laid into the room
+   at scale 0.461 (fitted numerically, see DESK), so
+
+       PX_PER_CM_UP = 210 * 0.461 / 73 = 1.3262 stage px per cm
+
+   The bench itself, from the committed constants: top face 438.7 x 126.0
+   stage px = 331 x 95 cm at this scale — a full-wall bench, not a 1.8 m desk.
+   Vertical is the axis this projection does not foreshorten at all, so props
+   that stand quote a height and use axis 'up'. Props lying on the desktop
+   quote their projected image extent and use axis 'along' — that quoted value
+   is ALREADY a projected extent, which is why FORESHORTEN below is 1.0: the
+   earlier cos(30°) applied projection twice and shrank everything lying flat
+   by a further ~15% (the audit measured the combined error at ~1.6x).
+   ══════════════════════════════════════════════════════════════════════ */
+/* ── THE DESK, SOLVED NUMERICALLY ──────────────────────────────────────
+   assets/desk-only.png is composited over assets/room-without-desk.png and the
+   result compared, pixel for pixel, against the original ONE-PIECE plate
+   reference/new-design/empty room.png, which still has the desk in it. Squared
+   error over (x, y, scale), coarse-to-fine at 1/4, 1/2 and full resolution,
+   over a fixed 700 x 500 ROI covering the desk and the floor around it.
+
+   Photometric best fit: x = 478, y = 472, scale = 0.461 (RMS 27.97 vs 40.98
+   with no desk; 15.08 is the floor). BUT that fit put the desk's rightmost
+   foot 101 px OUTSIDE the carpet — the one-piece render itself drew the desk
+   slightly through the glass, so matching it faithfully reproduced its error.
+
+   The placement is therefore constrained by physics instead: every real foot
+   must stand on carpet. Feet read off the derived asset (alpha>200 and not the
+   converted shadow): back-left (69,376), front-right (838,800), right end
+   (1029,670). Largest scale / rightmost x satisfying all three:
+
+       x = 414, y = 470, scale = 0.462   — right foot 1 px from the glass line.
+
+   FOUR LEGS. The original render had only three (no back-right leg — the
+   corner floated). desk-4legs.png is that same render with the fourth leg
+   grafted in Python: the back-left leg (same depth, so same lighting) copied
+   to descend from the far top-face corner T(342,182 in the 1305 x 1206 frame)
+   for 238 px, painted only over background, never over the slab. Same crop,
+   1109 x 810 vs 1107 x 809, so the fitted placement carries over unchanged. */
+const DESK = {
+  /* ONE PAINTING now (owner's P5 generation, 2026-09-06): the desk and all
+     ten still objects in a single coherent perspective and light. The chair,
+     jelly, sticky note and clock hands stay live. Fit solved so the bench's
+     world length and centre match the old desk exactly — nothing else moved. */
+  src: 'assets/derived/desk-scene.png',
+  w: 1389, h: 1206,   /* +246: legs extended to the room's floor line */
+  fitX: 435.6, fitY: 425.9, fitScale: 0.3468,
+  z: 130,
+  /* The desktop's top face, read off the desk asset's own alpha: the extreme
+     points of the wood mask in each of the four diagonal directions, which for
+     this parallelogram are its corners. Left (8,133), Top (251,8),
+     Right (1099,440); the fourth follows as L + R − T = (856,565) and lands on
+     the painted near corner to within a pixel.
+       along = L -> N, the length of the bench, left end to right end
+       depth = L -> T, front edge to back edge
+     Anything that sits on the desk is placed as (u along, v across). */
+  faceL: [4, 225],
+  faceAlong: [1034, 734],
+  faceDepth: [308, -166],
+  vertPx: 280,                              // work surface (front edge, y=168) to leg foot, at x = 70
+  heightCm: 73
+};
+const SRC_TO_STAGE = DESK.fitScale;
+const PX_PER_CM_UP = DESK.vertPx * SRC_TO_STAGE / DESK.heightCm;
+/* 'along' cm values are already projected image extents — do not project twice.
+   The old cos(30°) here compounded with the vertPx misread to make everything
+   lying on the desktop ~1.6x too small (audit, proportions lens). */
+const FORESHORTEN = 1.0;
+const PX_PER_CM_ALONG = PX_PER_CM_UP * FORESHORTEN;
+
+/* THE ONE FUDGE, AND IT IS EXPLICIT.
+   The room is genuinely large — a ~3.3 m bench in a ~4.8 m room — so a 9 cm mug
+   drawn honestly is unreadable and unclickable at any framing that shows the
+   room. Every object therefore runs one global factor over life size. It lives
+   here, once, and the PROPS table below stays in real centimetres, so the
+   proportions between objects remain exactly right and the size of the lie is
+   a single number anyone can change. 2.00 was solved against the approved art
+   (which itself draws desk objects at ~3.14 px/cm equivalent, so this is still
+   the conservative side of what the art licenses). */
+const OBJECT_SCALE_BOOST = 1.50;
+
+/** A point on the desktop. u runs 0..1 along the bench, v 0..1 front to back.
+    Returns stage pixels. */
+function deskPoint(u, v) {
+  return {
+    x: DESK.fitX + SRC_TO_STAGE * (DESK.faceL[0] + u * DESK.faceAlong[0] + v * DESK.faceDepth[0]),
+    y: DESK.fitY + SRC_TO_STAGE * (DESK.faceL[1] + u * DESK.faceAlong[1] + v * DESK.faceDepth[1])
+  };
+}
+
+/* ── THE OBJECT TABLE ──────────────────────────────────────────────────
+   src   file under assets/derived/ — the prepared cut-outs, baked contact
+         shadow removed, see tools/prepare-assets.py
+   w,h   the source PNG's natural size. These are tight crops with a 2 px
+         transparent margin, so the content box IS the image and there is no
+         `box` column any more: the whole class of "the bbox fraction was
+         guessed" errors is gone with it.
+   cm    the object's REAL size, and `axis` says which one:
+           'up'    a height, straight up the picture     -> PX_PER_CM_UP
+           'along' a width in the room's receding plane  -> PX_PER_CM_ALONG
+         Objects that stand get 'up'; objects lying on the desktop get 'along',
+         because their image height is an in-plane length seen foreshortened
+         and reading it as a height would size them completely wrong.
+   on    'desk' -> `at` is (u along the bench, v across it), fed through
+         deskPoint() so the object touches the wood by construction
+         'world' -> `at` is a fraction of the world box
+   foot  which point of the image that touches down; [0.5, 1] = bottom centre
+   shadow  [width as a fraction of the object's width, height as a fraction of
+         THAT width, blur px, how far the ellipse sits above the image's
+         bottom edge as a fraction of the object's height] — the contact
+         shadow drawn under it in CSS
+
+   Left to right along the bench. Everything is real centimetres; nothing here
+   is hand-sized. OBJECT_SCALE_BOOST is the only multiplier. */
+const PROPS = [
+  /* LAYOUT PRINCIPLE: one used desk, not two piles. Back row (v ≥ 0.6) is
+     the reference shelf: clock, books, lamp, folder, mug. Front row (v ≤ 0.4)
+     is the working zone in front of the sitter: notebook, laptop (facing the
+     chair), letter, photos, iPod. Rows are listed back-to-front so DOM order
+     is paint order within the shared desk depth. */
+  /* ── BACK ROW, v = 0.76 ─────────────────────────────────────────────
+     u positions are SOLVED, not nudged. Each object's width as a fraction of
+     the bench is cm x PX_PER_CM x BOOST / 440 px, and the ten objects total
+     607 px against 440 px of bench — 38% over-full, which is why everything
+     collided. Split into two rows (back 249 px, front 358 px) both fit, and
+     every same-row gap below is positive; the smallest is +0.026 of the bench.
+     Listed back row first so DOM order is paint order within the desk depth. */
+  /* folder-flat.png is sliced from folder360.png (bottom row, 4th cell): the
+     folder LYING flat and receding to the upper right, matching the desk's
+     perspective. The single-angle tanfolder.png was drawn nearly top-down and
+     read as standing on end wherever it sat on this receding desk. */
+
+  /* ── FRONT ROW, v = 0.24 — the working surface in front of the sitter ── */
+  /* laptop-facing.png is laptoregen.png mirrored, so the SCREEN faces the
+     chair. u 0.55 puts it directly in front of the chair at u 0.56 — the
+     owner asked for it within reach so it reads as the thing to click. */
+  /* The jelly. A real soft body (owner, 2026-09-06, after a WebGPU FEM demo):
+     grab it and pull, it stretches and jiggles back; tap to poke it and cycle
+     the flavour (berry / mint / honey, like the demo's specimen picker). A
+     verlet spring lattice warps the owner's painted jelly on a canvas —
+     see the JELLY ENGINE section. */
+  { id: 'jelly', label: 'jelly', src: 'jelly-berry.png', w: 480, h: 437,
+    cm: 9, axis: 'up', on: 'desk', at: [0.63, 0.72], foot: [0.5, 1],
+    shadow: [0.92, 0.30, 2, 0.020], z: DESK.z, jelly: true },
+
+
+  /* Not on the desk. The note is stuck to the glass of the right-hand pane, so
+     it lives on the reference plane with the room shell — no parallax at all
+     against the window it is stuck to. The chair stands on the carpet in
+     front of the bench; its contact point is deskPoint(u, v) dropped by the
+     desk's own 73 cm, so it is placed against the desk rather than against
+     the picture.
+       cm 97: the approved art draws the chair 187 px tall against a 317.9 px
+       desk top-face — ratio 0.588, i.e. 258 stage px here, and 258 / (1.3262
+       * 2.00) = 97. (An earlier comment claimed a 1.19x ratio; measured, the
+       real figure is ~2x that, which is why the chair used to read as a toy.)
+       at [0.56, -1.15]: seats the sitter at the laptop (u 0.53; the chair's
+       forward offset shifts it visually left, correct in this projection) at
+       the art's stand-off from the bench. Was [0.32, -0.55] — 62 cm left of
+       the laptop and half the stand-off, i.e. facing the folder.
+       shadow null + no hover lift: the chair KEEPS its painted floor shadow
+       (prepare-assets 'shadow' mode), so a CSS ellipse would be a second
+       shadow, and a hover lift would slide the painted one up the carpet. */
+  { id: 'note', label: 'note', src: 'stickynote.png', w: 889, h: 966,
+    cm: 8, axis: 'up', on: 'world', at: [0.640, 0.452], foot: [0.5, 1],
+    shadow: null, z: 0 },
+  { id: 'chair', label: 'chair', src: 'only-chair.png', w: 324, h: 448,
+    cm: 116, axis: 'up', on: 'floor', at: [0.56, -1.15], foot: [0.5, 1],
+    shadow: null, lift: false, spin: true, z: 200 }
+];
+
+/**
+ * cm -> geometry. Pure. Returns the layer box in stage pixels plus the framing
+ * box a POI wants. The assets are tight crops, so image box == content box.
+ */
+function layoutProp(p) {
+  const target = p.cm * (p.axis === 'up' ? PX_PER_CM_UP : PX_PER_CM_ALONG) * OBJECT_SCALE_BOOST;
+  const imgW = p.axis === 'up' ? target * p.w / p.h : target;
+  const imgH = imgW * p.h / p.w;
+
+  let foot;
+  if (p.on === 'desk') {
+    foot = deskPoint(p.at[0], p.at[1]);
+  } else if (p.on === 'floor') {
+    // the same desktop parameterisation, then straight down by the desk's own
+    // height, which is the one distance in this drawing that is not
+    // foreshortened at all
+    const d = deskPoint(p.at[0], p.at[1]);
+    foot = { x: d.x, y: d.y + DESK.heightCm * PX_PER_CM_UP };
+  } else {
+    foot = { x: p.at[0] * WORLD.w, y: p.at[1] * WORLD.h };
+  }
+
+  const left = foot.x - p.foot[0] * imgW;
+  const top = foot.y - p.foot[1] * imgH;
+  return {
+    prop: p,
+    left: left, top: top, width: imgW, height: imgH,
+    poi: { id: p.id, label: p.label, x: left + imgW / 2, y: top + imgH / 2, w: imgW, h: imgH }
+  };
+}
+
+const LAYOUT = PROPS.map(layoutProp);
+
+/* Points of interest for the magnetic settle. The props' framing boxes come
+   straight out of the scale system, so a POI can never disagree with the
+   object it is pointing at. The two plates are given by hand. */
+const DESK_MID = deskPoint(0.5, 0.5);
+const POIS = [
+  { id: 'tree', label: 'tree', x: 0.605 * WORLD.w, y: 0.360 * WORLD.h, w: 0.26 * WORLD.w, h: 0.30 * WORLD.h },
+  { id: 'desk', label: 'desk',
+    x: DESK_MID.x, y: DESK_MID.y,
+    w: DESK.w * SRC_TO_STAGE, h: DESK.h * SRC_TO_STAGE }
+].concat([
+  /* the objects baked into the desk painting: fly-to targets in (u, v) desk
+     coordinates so they survive any future re-fit of the plate */
+  { id: 'clock', u: 0.033, v: 0.82 }, { id: 'lamp', u: 0.16, v: 0.78 },
+  { id: 'ipod', u: 0.07, v: 0.50 },  { id: 'notebook', u: 0.25, v: 0.45 },
+  { id: 'laptop', u: 0.42, v: 0.45 },{ id: 'letter', u: 0.55, v: 0.30 },
+  { id: 'books', u: 0.64, v: 0.50 }, { id: 'journal', u: 0.72, v: 0.28 },
+  { id: 'photos', u: 0.84, v: 0.33 },{ id: 'mug', u: 0.92, v: 0.30 }
+].map(function (b) {
+  const pt = deskPoint(b.u, b.v);
+  return { id: b.id, label: b.id, x: pt.x, y: pt.y - 18, w: 70, h: 60 };
+})).concat(LAYOUT.map((l) => l.poi));
+
+/* THE DEFAULT FRAMING. The room is big and the objects are small, so opening
+   on the whole model shows a room with specks on the bench. Home is therefore
+   1.9x closer than the whole-room fit and centred just above the desk, and the
+   pull-back allowance is widened by exactly the same 1.9 so the whole model is
+   still reachable — one number, moved from one place to another, not a new
+   limit. HOME_FOCUS is the desk's mid point lifted 45 px so the window and the
+   tree stay in frame above the bench. */
+const HOME_BOOST = 1.9;
+const HOME_FOCUS = { x: DESK_MID.x - 14, y: DESK_MID.y - 45 };
+
+/* ══════════════════════════════════════════════════════════════════════
+   THE JELLY ENGINE, v3 — a deformation FIELD, not a free mesh.
+
+   v2 was a verlet lattice; a lattice has enough degrees of freedom to fold
+   its cells inside-out, and folded states are stable — the owner's crumpled
+   "weird shapes" after hard drags. v3 removes the freedom to be wrong: the
+   whole surface is an analytic function of ONE spring state P (the pull at
+   the grab point). Every vertex moves by P weighted with a smooth gaussian
+   falloff and a base anchor, so the surface is smooth by construction, folds
+   cannot exist, release rings the spring (a real damped ~4.5 Hz jiggle with
+   overshoot), and rest is EXACTLY the painted jelly. A small coupled squash
+   term keeps the volume feel: stretch up narrows, squash down bulges.
+   The rAF loop runs only while |P| or |V| is alive; rest costs nothing.
+   ══════════════════════════════════════════════════════════════════════ */
+function buildJelly(box, img) {
+  const FLAV = ['berry', 'mint', 'honey'];
+  const texs = FLAV.map(function (f) {
+    const t = new Image(); t.src = 'assets/derived/jelly-' + f + '.png'; return t;
+  });
+  let flav = 0;
+
+  const TW = 480, TH = 437, PADF = 0.4;
+  const PX = TW * PADF, PY = TH * PADF;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(TW * (1 + 2 * PADF));
+  canvas.height = Math.round(TH * (1 + 2 * PADF));
+  canvas.className = 'jelly-canvas';
+  canvas.style.left = (-100 * PADF) + '%';
+  canvas.style.top = (-100 * PADF) + '%';
+  canvas.style.width = (100 * (1 + 2 * PADF)) + '%';
+  canvas.style.height = (100 * (1 + 2 * PADF)) + '%';
+  img.style.visibility = 'hidden';               // img still sizes the box
+  box.appendChild(canvas);
+  box.classList.add('prop--spinnable');
+  box.setAttribute('role', 'button');
+  box.setAttribute('tabindex', '0');
+  box.setAttribute('aria-label', 'Play with the jelly');
+  box.setAttribute('data-nodrag', '');
+  const ctx = canvas.getContext('2d');
+
+  const COLS = 8, ROWS = 6, N = (COLS + 1) * (ROWS + 1);
+  const rx = new Float64Array(N), ry = new Float64Array(N);
+  const px_ = new Float64Array(N), py_ = new Float64Array(N);
+  for (let r = 0; r <= ROWS; r++) {
+    for (let c = 0; c <= COLS; c++) {
+      const i = r * (COLS + 1) + c;
+      rx[i] = PX + TW * c / COLS; ry[i] = PY + TH * r / ROWS;
+      px_[i] = rx[i]; py_[i] = ry[i];
+    }
+  }
+
+  /* the one spring: P = pull at the grab point, V its velocity */
+  const SIGMA = TW * 0.36, OMEGA = 28, ZETA = 0.13, STRETCH = TW * 0.52;
+  let Px = 0, Py = 0, Vx = 0, Vy = 0;
+  let hopY = 0, hopV = 0, lastTap = 0;           // the JUMP (double-tap)
+  let gpx = PX + TW / 2, gpy = PY + TH * 0.35;   // grab point, rest space
+  let grabbing = false, tgx = 0, tgy = 0;        // pointer target while held
+  let running = false;
+
+  function field() {
+    const cx = PX + TW / 2;
+    /* normalise so the point UNDER THE CURSOR follows it 1:1 — without this
+       the falloff made the grab lag the hand (owner: "not following the
+       cursor"). Neighbours still move less, the base stays seated. */
+    const wg = Math.max(0.25, 1 - Math.pow((gpy - PY) / TH, 1.5));
+    for (let i = 0; i < N; i++) {
+      const dx = rx[i] - gpx, dy = ry[i] - gpy;
+      const w = Math.min(1.15, Math.exp(-(dx * dx + dy * dy) / (2 * SIGMA * SIGMA)) *
+                (1 - Math.pow((ry[i] - PY) / TH, 1.5)) / wg);
+      px_[i] = rx[i] + Px * w
+             - 0.22 * Py * w * (rx[i] - cx) / (TW / 2);   // squash couples
+      py_[i] = ry[i] + Py * w - hopY * (1 - 0.3 * (ry[i] - PY) / TH);
+    }
+  }
+
+  function stepSpring() {
+    const dt = 1 / 60;
+    if (grabbing) {
+      Px += (tgx - Px) * 0.65; Py += (tgy - Py) * 0.65;
+      Vx = (tgx - Px) * 8; Vy = (tgy - Py) * 8;
+    } else {
+      Vx += (-OMEGA * OMEGA * Px - 2 * ZETA * OMEGA * Vx) * dt;
+      Vy += (-OMEGA * OMEGA * Py - 2 * ZETA * OMEGA * Vy) * dt;
+      Px += Vx * dt; Py += Vy * dt;
+    }
+    /* the hop: ballistic, lands with a squash impulse */
+    if (hopY > 0 || hopV !== 0) {
+      hopV -= 3400 * dt;
+      hopY += hopV * dt;
+      if (hopY <= 0) {
+        if (hopV < -150) { Vy += 260; SND.play('squish'); }   // landing squash
+        hopY = 0; hopV = 0;
+      }
+    }
+  }
+
+  function tri(x0, y0, x1, y1, x2, y2, u0, v0, u1, v1, u2, v2, tex) {
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.closePath(); ctx.clip();
+    const du1 = u1 - u0, dv1 = v1 - v0, du2 = u2 - u0, dv2 = v2 - v0;
+    const det = du1 * dv2 - du2 * dv1 || 1e-6;
+    const a = ((x1 - x0) * dv2 - (x2 - x0) * dv1) / det;
+    const b = ((y1 - y0) * dv2 - (y2 - y0) * dv1) / det;
+    const c = ((x2 - x0) * du1 - (x1 - x0) * du2) / det;
+    const d = ((y2 - y0) * du1 - (y1 - y0) * du2) / det;
+    ctx.transform(a, b, c, d, x0 - a * u0 - c * v0, y0 - b * u0 - d * v0);
+    ctx.drawImage(tex, 0, 0);
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const tex = texs[flav];
+    if (!tex.complete || !tex.naturalWidth) return;
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const i = r * (COLS + 1) + c, j = i + 1, k2 = i + COLS + 1, l = k2 + 1;
+        const u0 = (rx[i] - PX) * tex.naturalWidth / TW, v0 = (ry[i] - PY) * tex.naturalHeight / TH;
+        const u1 = (rx[j] - PX) * tex.naturalWidth / TW, v1 = (ry[j] - PY) * tex.naturalHeight / TH;
+        const u2 = (rx[k2] - PX) * tex.naturalWidth / TW, v2 = (ry[k2] - PY) * tex.naturalHeight / TH;
+        const u3 = (rx[l] - PX) * tex.naturalWidth / TW, v3 = (ry[l] - PY) * tex.naturalHeight / TH;
+        tri(px_[i], py_[i], px_[j], py_[j], px_[k2], py_[k2], u0, v0, u1 + 0.7, v1, u2, v2 + 0.7, tex);
+        tri(px_[l], py_[l], px_[j], py_[j], px_[k2], py_[k2], u3, v3, u1 + 0.7, v1 - 0.7, u2 - 0.7, v2 + 0.7, tex);
+      }
+    }
+  }
+
+  function loop() {
+    stepSpring(); field(); draw();
+    if (grabbing || hopY > 0 || Math.hypot(Px, Py) > 0.3 || Math.hypot(Vx, Vy) > 6) {
+      requestAnimationFrame(loop);
+    } else {
+      Px = Py = Vx = Vy = 0;
+      field(); draw();
+      running = false;
+    }
+  }
+  function wake() { if (!running) { running = true; requestAnimationFrame(loop); } }
+
+  function canvasPoint(e) {
+    const rect = canvas.getBoundingClientRect();
+    return [(e.clientX - rect.left) * canvas.width / rect.width,
+            (e.clientY - rect.top) * canvas.height / rect.height];
+  }
+  function clampStretch(x, y) {
+    const d = Math.hypot(x, y);
+    return d > STRETCH ? [x * STRETCH / d, y * STRETCH / d] : [x, y];
+  }
+  function poke(x, y, kick) {
+    if (reduceQuery.matches) return;
+    gpx = Math.max(PX, Math.min(PX + TW, x));
+    gpy = Math.max(PY, Math.min(PY + TH * 0.8, y));
+    Vx += (Math.random() - 0.5) * 60; Vy -= kick;
+    SND.play('squish');
+    wake();
+  }
+
+  let downAt = null;
+  canvas.addEventListener('pointerdown', function (e) {
+    canvas.setPointerCapture(e.pointerId);
+    const pt = canvasPoint(e);
+    downAt = pt;
+    if (!reduceQuery.matches) {
+      gpx = Math.max(PX, Math.min(PX + TW, pt[0]));
+      gpy = Math.max(PY, Math.min(PY + TH * 0.8, pt[1]));
+      grabbing = true; tgx = 0; tgy = 0;
+      wake();
+    }
+    e.preventDefault();
+  });
+  let lastMove = [0, 0, 0];                       // x, y, t — for the throw
+  canvas.addEventListener('pointermove', function (e) {
+    if (!grabbing) return;
+    const pt = canvasPoint(e);
+    lastMove = [pt[0], pt[1], performance.now()];
+    const t = clampStretch(pt[0] - downAt[0], pt[1] - downAt[1]);
+    tgx = t[0]; tgy = t[1];
+  });
+  function release(e) {
+    if (downAt && e && Math.hypot(canvasPoint(e)[0] - downAt[0], canvasPoint(e)[1] - downAt[1]) < 9) {
+      const now2 = performance.now();
+      if (now2 - lastTap < 380 && !reduceQuery.matches) {
+        if (hopY <= 0) {                            // grounded only: no stacking
+          hopV = 620; hopY = 0.01;                  // double-tap: JUMP
+          Vy -= 320;                                // anticipation stretch
+          SND.play('squish');
+        }
+      } else {
+        flav = (flav + 1) % FLAV.length;           // a tap: poke + next flavour
+        poke(downAt[0], downAt[1], 220);
+      }
+      lastTap = now2;
+    }
+    /* a fast upward drag THROWS the jelly: it leaps once, grounded-gated */
+    if (grabbing && hopY <= 0 && !reduceQuery.matches && tgy < -TW * 0.04) {
+      hopV = Math.min(820, 300 - tgy * 3.6); hopY = 0.01;
+      SND.play('squish');
+    }
+    grabbing = false; downAt = null; wake();
+  }
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', function () { grabbing = false; downAt = null; wake(); });
+  /* stuck-guards: if capture is lost or the tab blurs mid-drag, let go */
+  canvas.addEventListener('lostpointercapture', function () { grabbing = false; downAt = null; wake(); });
+  window.addEventListener('blur', function () { grabbing = false; downAt = null; wake(); });
+  box.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      flav = (flav + 1) % FLAV.length;
+      poke(PX + TW / 2, PY + TH / 3, 220);
+    }
+  });
+  texs[0].addEventListener('load', function () { field(); draw(); });
+  if (texs[0].complete) { field(); draw(); }     // cached textures never fire 'load'
+}
+
+const el = {
+  viewport: document.getElementById('viewport'),
+  stage: document.getElementById('stage'),
+  doorScene: document.getElementById('doorScene'),
+  doorFrame: document.getElementById('doorFrame'),
+  doorLeaf: document.getElementById('doorLeaf'),
+  doorShadow: document.getElementById('doorShadow'),
+  doorShade: document.getElementById('doorShade'),
+  doorEdge: document.getElementById('doorEdge'),
+  knobTwist: document.getElementById('knobTwist'),
+  bloom: document.getElementById('bloom'),
+  hud: document.getElementById('hud'),
+  hint: document.getElementById('hint'),
+  ui: document.getElementById('ui'),
+  pois: document.getElementById('pois'),
+  live: document.getElementById('live'),
+  enterKnob: document.getElementById('enterKnob'),
+  exitKnob: document.getElementById('exitKnob'),
+  btnIn: document.getElementById('btnIn'),
+  btnOut: document.getElementById('btnOut')
+};
+
+/* ── windows ───────────────────────────────────────────────────────────
+   MEASURED, not drawn by hand. From assets/room-without-desk.png:
+
+     1. pane candidates = alpha > 128 AND (R − B) < 55 AND R > 150 AND G > 150.
+        The frames are a distinctly warmer, darker wood — (192,124,63) against
+        (252,250,246) glass — so that one test separates glass from frame
+        cleanly, while glass and wall stay together.
+     2. 4-connected flood from a seed inside each pane. The frame is continuous
+        all the way round both openings, so the flood stops exactly at the
+        wood: sidelight 30,024 px, main window 131,896 px.
+     3. convex hull of the component, Douglas-Peucker at 2 px, then inset 1.5 px
+        towards the centroid so the clip lands inside the frame rather than on
+        it. Coverage of the fitted polygon against the flooded component:
+        0.53% of the polygon falls outside the glass on the sidelight, 0.50% on
+        the main window, and both of those are the inset band itself.
+     4. The main window is split at its mullion, so the painted mullion
+        survives instead of being buried under the tree. The mullion was fitted
+        from the pixels the pane test rejects inside the opening:
+            x = −0.066224·y + 796.279,  sd 0.17 px
+        and each pane is held 1.2 px clear of it.
+
+   Percentages are of the 1306 x 1205 world box. */
+const TREE_Z = -450;                  // s = 0.800; see PERSPECTIVE above
+const CORRIDOR_Z = -80;               // just beyond the door wall: barely-there parallax
+
+/* kind 'tree' panes look at the cherry tree. The SIDELIGHT is an INTERIOR
+   pane: in the approved art it looks into the office corridor — plank floor,
+   round white table, potted plant — which is also where the door leads.
+   Giving it the tree had the room looking outdoors through its own inside
+   wall (audit, tree-art lens; corridor-pane.png is the commissioned view). */
+const WINDOWS = [
+  { id: 'sidelight', kind: 'corridor',
+    poly: [[33.989, 17.718], [34.296, 17.884], [34.372, 18.880], [36.202, 50.332],
+           [35.743, 50.913], [31.256, 53.237], [28.453, 19.701]] },
+  { id: 'window-l', kind: 'tree',
+    poly: [[48.155, 16.946], [54.242, 15.477], [59.778, 18.019], [57.615, 53.417], [48.009, 45.801]] },
+  { id: 'window-r', kind: 'tree',
+    poly: [[59.957, 18.101], [73.254, 24.207], [68.492, 62.041], [57.790, 53.556]] }
+];
+
+/* ── the tree, COMPOSED ────────────────────────────────────────────────
+   The old single-raster tree is gone: its blossoms measured ~4x life size,
+   its sky was unpainted paper-white, and one flat bitmap can only ever move
+   as one rigid thing — the exact motion the owner rejected. In its place,
+   real pieces, generated separately and each cut out with true alpha:
+   a far blossom haze for depth, the trunk with its bare limbs, and five
+   blossom branches, each hinged at the measured point where its bough runs
+   off its own frame.
+
+   COVERAGE IS NOW STRUCTURAL, NOT PROVED. The slot's own background is a
+   painted lavender sky filling the entire aperture, so the wall can never
+   show through regardless of where any branch moves. The old exhaustive
+   123,984-pose cover sweep and the 22 px sway budget existed only because
+   the single opaque raster was the last line of defence; they are obsolete
+   and deleted. Branch amplitude is an aesthetic choice now, not a safety
+   bound. */
+const CORRIDOR = { src: 'corridor-pane.png', w: 853, h: 1844 };
+
+/* ONE square canvas shared by the two TREE panes. They look at the same tree
+   across the painted mullion, so they must be given the same canvas at the
+   same place or the canopy would break at the divide. Sized to the panes'
+   joint bbox plus the exact parallax bound (the layer offset is (1 − s)·c,
+   |c| ≤ half the world box) plus a seam — generous rather than proved,
+   because the sky backstop now carries the guarantee. */
+const TREE_BOX = (function () {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  WINDOWS.filter((w) => w.kind === 'tree').forEach(function (w) {
+    w.poly.forEach(function (p) {
+      if (p[0] < x0) x0 = p[0];
+      if (p[0] > x1) x1 = p[0];
+      if (p[1] < y0) y0 = p[1];
+      if (p[1] > y1) y1 = p[1];
+    });
+  });
+  const bx = x0 / 100 * WORLD.w, bw = (x1 - x0) / 100 * WORLD.w;
+  const by = y0 / 100 * WORLD.h, bh = (y1 - y0) / 100 * WORLD.h;
+  const f = Math.abs(1 - depthFactor(TREE_Z, PERSPECTIVE));
+  const mx = f * WORLD.w / 2 + 24;
+  const my = f * WORLD.h / 2 + 24;
+  const side = Math.max(bw + 2 * mx, bh + 2 * my);
+  return { left: bx + bw / 2 - side / 2, top: by + bh / 2 - side / 2, side: side };
+})();
+
+/* The composition. Each layer: src under assets/ (real alpha cut-outs), its
+   natural w/h, box {x, y, wf} as fractions of the square canvas (height
+   follows from the aspect ratio), transform-origin at the measured HINGE —
+   the midpoint of the opaque run along the frame edge the bough exits
+   through, read off each PNG's own alpha channel — amp as a fraction of
+   WIND_THETA_MAX, and lag in seconds.
+
+   The motion design: the trunk barely moves, big boughs follow, small and
+   hanging branches move most, and the lags stagger each gust's arrival so
+   the wind visibly TRAVELS through the canopy instead of the whole tree
+   swinging in lockstep — which was the owner's exact complaint. */
+/* Rows with H/T are BOUGHS and bend (research/branch-bend.md): H is the hinge
+   — midpoint of the opaque run along the edge the bough exits — and T is the
+   tip, the centroid of the farthest 6% radial band of opaque pixels from H,
+   both in the PNG's own pixels. `dir` makes every tip move screen-right on a
+   gust (kills the see-saw of mixed signs). Rows without H/T are single rigid
+   layers: the far haze drifts, the trunk barely moves (SpeedTree's "shared"
+   tier, which "almost never" gets branch motion). */
+const TREE_LAYERS = [
+  { src: 'blossom-far.png',       w: 1254, h: 1254, x: 0.00, y: 0.00, wf: 1.00, origin: '50% 120%', amp: 0.10, lag: 0.45, drift: true },
+  { src: 'tree-trunk.png',        w: 1254, h: 1254, x: 0.20, y: 0.42, wf: 0.66, origin: '50% 100%', amp: 0.25, lag: 0.00 },
+  { src: 'branch-left.png',       w: 1386, h: 910,  x: 0.00, y: 0.28, wf: 0.60, H: [0, 742],     T: [1327, 264],  amp: 1.00, lag: 0.10, dir: +1 },
+  { src: 'branch-right.png',      w: 1353, h: 824,  x: 0.42, y: 0.40, wf: 0.58, H: [1353, 339],  T: [55, 414],    amp: 0.95, lag: 0.16, dir: -1 },
+  { src: 'branch-topleft.png',    w: 1165, h: 1259, x: 0.06, y: 0.00, wf: 0.40, H: [0, 20],      T: [871, 1160],  amp: 1.10, lag: 0.22, dir: -1 },
+  { src: 'branch-topright.png',   w: 1112, h: 1268, x: 0.55, y: 0.02, wf: 0.40, H: [1112, 16],   T: [112, 1170],  amp: 1.05, lag: 0.27, dir: -1 },
+  { src: 'branch-bottomleft.png', w: 1287, h: 1198, x: 0.00, y: 0.58, wf: 0.44, H: [0, 990],     T: [1120, 197],  amp: 0.90, lag: 0.13, dir: +1 }
+];
+
+/* natural-motion.md §2.7 quoted THETA_MAX = 1.10° against a 567 px plate.
+   Each branch here is roughly that plate's size in canvas terms, and with the
+   sky as backstop the angle is aesthetic rather than a safety bound, so the
+   report's number is used directly. Frequencies, amplitude split, golden-angle
+   phases and the gust envelope are §2.7 verbatim below. */
+/* Interim: 0.55° until the bend model lands. The owner judged 1.10° on a
+   rigid bough as "moving too much" — correct, because a rigid rotation moves
+   the whole bough by the tip angle, whereas a real bough only reaches that
+   angle AT the tip. The proper fix is bending (research/branch-bend.md);
+   this halves the excursion in the meantime. */
+const WIND_THETA_MAX = 0.55;
+
+const treeLayers = [];        // rigid layers: { el, amp, lag, drift }, in every tree pane
+const boughs = [];            // bending boughs: { segs, branch, angles }, in every tree pane
+
+/* ══════════════════════════════════════════════════════════════════════
+   BOUGH BENDING — research/branch-bend.md §6.1, verbatim.
+
+   Bend profile: Habel, Kusternig & Wimmer 2009 eq.(7), tapered cantilever
+   u(x) = c2·x² + c4·x⁴ with taper α = 0.2 (their Table 1). Normalised so the
+   tip is 1. Chain weights are the second differences of that curve, so the
+   polyline passes through it at every seam and Σ w_i(1 − s_i) = 1 exactly:
+   TIP_DEG·amp IS the tip chord angle, and a hard ceiling because |sway| ≤ 1.
+   Sub-branch lag (tier B) is a per-segment time delay linear along the bough;
+   flutter (tier C) is a small fast rotation on the outer segments only, at
+   1.975 Hz — Unity/Crysis' shipped edge-flutter constant — plus a φ-spaced
+   second term. Numbers marked "judgement" in the report are just that.
+   ══════════════════════════════════════════════════════════════════════ */
+const BEND = {
+  C2: 0.374571, C4: 0.129428,        // Habel 2009, α = 0.2
+  TIP_DEG: 0.80,                     // tip CHORD ceiling → tip δ/L = 1.40% at the rare coincident peak
+  TAU_TIP: 0.25,                     // s; tip lags hinge (whip), linear in s — judgement
+  /* 5 segments, not 8. The bend curve is a smooth quadratic-ish, so 5 chords
+     track it to well under a pixel, and each segment costs a composited layer
+     holding a scaled copy of a ~1.3 MP image. At 8 the scene carried 120 such
+     layers across three panes and re-rasterised all of them during a zoom,
+     which is what made panning lag and flicker. 5 puts it at 75, and only the
+     visible scene's are stepped. */
+  N: 5, OVERLAP: 10,                 // segments per bough; px each strip runs past its seam
+  FLUT: { F: [1.975, 1.975 * 1.6180339887498949], AMP: [0.618034, 0.381966],
+          DEG: 0.18, S0: 0.5, FLOOR: 0.6 }
+};
+function uHat(s) { return (BEND.C2 * s * s + BEND.C4 * s ** 4) / (BEND.C2 + BEND.C4); }
+function segmentWeights(N) {
+  const w = new Array(N); let prev = 0;
+  for (let i = 0; i < N; i++) { const m = N * (uHat((i + 1) / N) - uHat(i / N)); w[i] = m - prev; prev = m; }
+  return w;
+}
+/** Unit sway in [-1, 1]: natural-motion.md §2.7's three-mode sum under the gust. */
+function swayUnit(t) {
+  return windGust(t) * (
+      WIND.AMP[0] * Math.sin(TAU * WIND.F[0] * t + WIND.PHS[0])
+    + WIND.AMP[1] * Math.sin(TAU * WIND.F[1] * t + WIND.PHS[1])
+    + WIND.AMP[2] * Math.sin(TAU * WIND.F[2] * t + WIND.PHS[2]));
+}
+function flutterRad(t, i, N) {
+  const s = i / N, F = BEND.FLUT;
+  if (s < F.S0) return 0;
+  const wc = ((s - F.S0) / (1 - F.S0)) ** 2;
+  const env = F.FLOOR + (1 - F.FLOOR) * windGust(t);
+  const psi = i * GOLDEN_ANGLE;
+  const f = F.AMP[0] * Math.sin(TAU * F.F[0] * t + psi) + F.AMP[1] * Math.sin(TAU * F.F[1] * t + psi * 2);
+  return F.DEG * Math.PI / 180 * wc * env * f;
+}
+/** Relative rotation, degrees, of every segment of one bough at t. Pure. */
+function segmentAnglesDeg(t, b, out) {
+  const N = b.N, tipRad = BEND.TIP_DEG * Math.PI / 180 * b.amp * b.dir;
+  for (let i = 0; i < N; i++) {
+    const s = i / N, tt = t - b.lag - BEND.TAU_TIP * s;
+    out[i] = (tipRad * b.w[i] * swayUnit(tt) + b.dir * flutterRad(t - b.lag, i, N)) * 180 / Math.PI;
+  }
+  return out;
+}
+
+/** Build one bough as a nested chain of N segments inside `host`, in the same
+    percentage box the rigid <img> would have used. research/branch-bend.md §6.2. */
+function buildBough(host, L, box) {
+  const N = BEND.N, ov = BEND.OVERLAP;
+  const root = document.createElement('div');
+  root.className = 'bough';
+  root.style.left = box.left; root.style.top = box.top; root.style.width = box.width;
+  root.style.aspectRatio = L.w + '/' + L.h;
+
+  const ux = L.T[0] - L.H[0], uy = L.T[1] - L.H[1];
+  const domX = Math.abs(ux) >= Math.abs(uy);            // slice along the dominant image axis
+  const segs = [];
+  let parent = root;
+  for (let i = 0; i < N; i++) {
+    const s0 = i / N, s1 = (i + 1) / N;
+    const seg = document.createElement('div');
+    seg.className = 'seg';
+    seg.style.transformOrigin = (100 * (L.H[0] + ux * s0) / L.w).toFixed(4) + '% ' +
+                                (100 * (L.H[1] + uy * s0) / L.h).toFixed(4) + '%';
+    const c0 = domX ? L.H[0] + ux * s0 : L.H[1] + uy * s0;
+    const c1 = domX ? L.H[0] + ux * s1 : L.H[1] + uy * s1;
+    let lo = Math.min(c0, c1) - ov, hi = Math.max(c0, c1) + ov;
+    const full = domX ? L.w : L.h, along = domX ? ux : uy;
+    if (i === 0 && along > 0) lo = 0;                    // hinge end runs to the image edge
+    if (i === 0 && along < 0) hi = full;
+    if (i === N - 1 && along > 0) hi = full;             // tip end runs to the image edge
+    if (i === N - 1 && along < 0) lo = 0;
+    lo = Math.max(0, lo); hi = Math.min(full, hi);
+    const len = hi - lo;
+
+    const strip = document.createElement('div');
+    strip.className = 'strip';
+    if (domX) { strip.style.left = (100 * lo / L.w).toFixed(4) + '%'; strip.style.width = (100 * len / L.w).toFixed(4) + '%'; strip.style.top = '0'; strip.style.height = '100%'; }
+    else      { strip.style.top = (100 * lo / L.h).toFixed(4) + '%'; strip.style.height = (100 * len / L.h).toFixed(4) + '%'; strip.style.left = '0'; strip.style.width = '100%'; }
+    const img = document.createElement('img');
+    img.src = 'assets/' + L.src; img.alt = ''; img.draggable = false;
+    img.width = L.w; img.height = L.h;
+    // The img spans the whole bough and is shifted so this strip's window shows
+    // its own band. Width in % of the strip (definite); shift in % of the img's
+    // OWN box, so nothing leans on a percentage height inside an aspect-ratio box.
+    if (domX) { img.style.width = (100 * L.w / len).toFixed(4) + '%'; img.style.transform = 'translateX(' + (-100 * lo / L.w).toFixed(4) + '%)'; }
+    else      { img.style.width = '100%';                                img.style.transform = 'translateY(' + (-100 * lo / L.h).toFixed(4) + '%)'; }
+    strip.appendChild(img);
+    seg.appendChild(strip);
+    parent.appendChild(seg);
+    parent = seg;                                        // the next segment rides on this one
+    segs.push(seg);
+  }
+  host.appendChild(root);
+  boughs.push({
+    segs: segs, scene: currentBuildScene,
+    branch: { amp: L.amp, lag: L.lag, dir: L.dir, N: N, w: segmentWeights(N) },
+    angles: new Array(N)
+  });
+}
+
+/* Which scene the layers being built belong to, so stepWind can skip the ones
+   that are not on screen. Set around each builder. */
+let currentBuildScene = 'room';
+
+/** Place one TREE_LAYERS row into a host, in a canvas of `side` px at (left,top),
+    with positions expressed as % of a (fw x fh) frame. Boughs bend; others are
+    rigid <img> layers driven by treeLayerTransform. */
+function placeTreeLayer(host, L, left, top, side, fw, fh) {
+  const box = {
+    left: (100 * (left + L.x * side) / fw).toFixed(4) + '%',
+    top: (100 * (top + L.y * side) / fh).toFixed(4) + '%',
+    width: (100 * L.wf * side / fw).toFixed(4) + '%'
+  };
+  if (L.H) { buildBough(host, L, box); return; }
+  const img = document.createElement('img');
+  img.className = 'tree-layer';
+  img.src = 'assets/' + L.src; img.alt = ''; img.draggable = false;
+  img.width = L.w; img.height = L.h;
+  img.style.left = box.left; img.style.top = box.top; img.style.width = box.width;
+  img.style.transformOrigin = L.origin;
+  host.appendChild(img);
+  treeLayers.push({ el: img, amp: L.amp, lag: L.lag, drift: !!L.drift, scene: currentBuildScene });
+}
+
+/** Axis-aligned bbox of a pane polygon, in stage px. Pure. */
+function paneBox(poly) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  poly.forEach(function (p) {
+    if (p[0] < x0) x0 = p[0];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[1] > y1) y1 = p[1];
+  });
+  return { x: x0 / 100 * WORLD.w, y: y0 / 100 * WORLD.h,
+           w: (x1 - x0) / 100 * WORLD.w, h: (y1 - y0) / 100 * WORLD.h };
+}
+
+function buildWindows() {
+  const frag = document.createDocumentFragment();
+  WINDOWS.forEach(function (w) {
+    const slot = document.createElement('div');
+    slot.className = 'slot';
+    slot.style.clipPath = 'polygon(' + w.poly.map((p) => p[0] + '% ' + p[1] + '%').join(', ') + ')';
+
+    const depth = document.createElement('div');
+    depth.className = 'depth';
+
+    if (w.kind === 'corridor') {
+      /* The interior pane. Height-fits the corridor art over the pane's bbox
+         plus its own (small) parallax margin; the art is far wider than this
+         narrow pane needs, so cover is comfortable. Static: corridors do not
+         sway. */
+      depth.dataset.z = CORRIDOR_Z;
+      const b = paneBox(w.poly);
+      const f = Math.abs(1 - depthFactor(CORRIDOR_Z, PERSPECTIVE));
+      const my = f * WORLD.h / 2 + 8;
+      const ih = b.h + 2 * my;
+      const iw = ih * CORRIDOR.w / CORRIDOR.h;
+      const img = document.createElement('img');
+      img.className = 'art';
+      img.src = 'assets/' + CORRIDOR.src;
+      img.alt = '';
+      img.width = CORRIDOR.w; img.height = CORRIDOR.h;
+      img.draggable = false;
+      img.style.left = (100 * (b.x + b.w / 2 - iw / 2) / WORLD.w).toFixed(4) + '%';
+      img.style.top = (100 * (b.y - my) / WORLD.h).toFixed(4) + '%';
+      img.style.width = (100 * iw / WORLD.w).toFixed(4) + '%';
+      depth.appendChild(img);
+    } else {
+      /* A tree pane. The painted sky IS the backstop: it fills the aperture
+         at the slot level, so no motion of any layer can ever expose the
+         wall. Colour anchored on the reference art's lavender (#DEBAD0). */
+      slot.style.background =
+        'linear-gradient(180deg, #d6c2e6 0%, #debad0 52%, #eecad7 100%)';
+      depth.dataset.z = TREE_Z;
+      TREE_LAYERS.forEach(function (L) {
+        placeTreeLayer(depth, L, TREE_BOX.left, TREE_BOX.top, TREE_BOX.side, WORLD.w, WORLD.h);
+      });
+    }
+
+    // A pane of glass over the lot, so the view and the plate's own painted
+    // glazing sit behind the same warm cast instead of looking pasted into a
+    // hole. Inside the clip, so it cannot touch the wall.
+    const glaze = document.createElement('div');
+    glaze.className = 'glaze';
+
+    slot.appendChild(depth);
+    slot.appendChild(glaze);
+    frag.appendChild(slot);
+  });
+  document.getElementById('windows').appendChild(frag);
+}
+
+/* The entry scene's window gets the SAME tree stack, so the branches sway
+   before the visitor ever opens the door — the owner called the still tree
+   there out specifically. Percentages are of the 1354 x 1161 entry frame.
+   The canvas is a square generously larger than the aperture bbox (68.24%..
+   83.97% x 15.94%..80.02%), centred on it, so no branch edge can reach the
+   clip; the sky backstop covers the rest. */
+function buildEntryWindow() {
+  const host = document.getElementById('entryWindow');
+  const bx = 68.24, bw = 83.97 - 68.24, by = 15.94, bh = 80.02 - 15.94;   // % of frame
+  const FW = 1354, FH = 1161;
+  const bwPx = bw / 100 * FW, bhPx = bh / 100 * FH;
+  /* This pane is tall and narrow (bbox 213 x 745 frame px), so a canvas sized
+     to its height shows only a thin vertical slice — and centred, that slice
+     is mostly trunk. Two biases: make the canvas a little wider than tall so
+     more crown falls inside the pane, and push it up so the trunk enters from
+     below and the blossom fills the upper pane, as the approved art frames it. */
+  const side = Math.max(bwPx, bhPx) * 1.55;                                 // px of frame
+  /* Place the canvas so the pane samples canvas x 0.28..0.46 (the left-centre
+     blossom mass) and y 0.05..0.70 (crown down to where the trunk just enters):
+     computed, not nudged — pane top at canvas 0.05, pane left at canvas 0.28. */
+  const left = (bx / 100 * FW) - 0.28 * side;
+  const top = (by / 100 * FH) - 0.05 * side;
+  currentBuildScene = 'door';
+  TREE_LAYERS.forEach(function (L) { placeTreeLayer(host, L, left, top, side, FW, FH); });
+  currentBuildScene = 'room';
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   WIND — natural-motion.md §2.7, verbatim.
+
+   Three canopy modes at incommensurate frequencies (f1 is the measured
+   whole-tree fundamental of an 18.6 m Scots pine; f2 and f3 are spaced by the
+   golden ratio so the sum has no short almost-period), under a slow squared
+   gust envelope, with a small non-uniform squash. THETA_MAX is a hard ceiling
+   because the amplitudes are normalised to sum to 1, which is what makes the
+   clip-edge bound below provable rather than hopeful.
+
+   It is a pure function of elapsed time: no state, no integration, nothing to
+   accumulate. That is what makes it bit-identical at 60/90/120/144 Hz and what
+   makes a dropped frame or a backgrounded tab cost exactly nothing.
+   ══════════════════════════════════════════════════════════════════════ */
+const TAU = Math.PI * 2;
+const GOLDEN_ANGLE = 2.399963229728653;
+const WIND = {
+  F: [0.260000, 0.420689, 0.680689],                        // Hz
+  AMP: [0.500000, 0.309017, 0.190983],                      // sums to 1
+  PHS: [0, GOLDEN_ANGLE, 2 * GOLDEN_ANGLE],
+  T_G1: 22.0,
+  T_G2: 22.0 / 1.6180339887498949,                          // 13.5967 s
+  E_MIN: 0.24,
+  THETA_MAX: WIND_THETA_MAX,                                // a hard ceiling; RMS is 0.228 of it
+  SQUASH: 0.004
+};
+
+function windGust(t) {
+  const raw = 0.62 * Math.sin(TAU * t / WIND.T_G1) + 0.38 * Math.sin(TAU * t / WIND.T_G2 + 2.4);
+  const g = 0.5 + 0.5 * raw;
+  return WIND.E_MIN + (1 - WIND.E_MIN) * g * g;
+}
+
+/** Sway angle in degrees at t seconds. Pure. */
+function windSwayDeg(t) {
+  return WIND.THETA_MAX * windGust(t) * (
+      WIND.AMP[0] * Math.sin(TAU * WIND.F[0] * t + WIND.PHS[0])
+    + WIND.AMP[1] * Math.sin(TAU * WIND.F[1] * t + WIND.PHS[1])
+    + WIND.AMP[2] * Math.sin(TAU * WIND.F[2] * t + WIND.PHS[2]));
+}
+
+/** The transform for one tree layer at t seconds. Pure.
+    Branches rotate about their own hinge with their own amplitude; the far
+    haze does not rotate at all — it breathes sideways very slowly, the way a
+    distant mass reads through glass. The per-layer lag means each gust
+    arrives at the trunk first and reaches the outer branches a beat later. */
+function treeLayerTransform(L, t) {
+  const tt = t - L.lag;
+  if (L.drift) {
+    const dx = 4 * windGust(tt) * Math.sin(TAU * 0.05 * tt);
+    return 'translateX(' + dx.toFixed(2) + 'px)';
+  }
+  const th = windSwayDeg(tt) * L.amp;
+  const r = th / WIND.THETA_MAX;
+  return 'rotate(' + th.toFixed(4) + 'deg) scaleX(' + (1 - WIND.SQUASH * r * r).toFixed(5) + ')';
+}
+
+let windT0 = null;
+let windFreezeT = null;                 // set by ?wind=<s> for still-frame verification
+let windFrameParity = 0;
+function stepWind(now) {
+  if ((windFrameParity = 1 - windFrameParity)) return;   // 30 Hz is plenty for a breeze
+  if (reduceQuery.matches) return;
+  if (windT0 === null) windT0 = now;
+  const t = windFreezeT !== null ? windFreezeT : (now - windT0) / 1000;
+  /* Only the scene on screen. Writing transforms to the hidden scene's layers
+     doubled the per-frame work for nothing, and every one of those writes
+     dirties a composited layer the compositor then has to consider. */
+  const live = sceneIsRoom ? 'room' : 'door';
+  for (let i = 0; i < treeLayers.length; i++) {
+    const L = treeLayers[i];
+    if (L.scene !== live) continue;
+    L.el.style.transform = treeLayerTransform(L, t);
+  }
+  for (let k = 0; k < boughs.length; k++) {
+    const b = boughs[k];
+    if (b.scene !== live) continue;
+    segmentAnglesDeg(t, b.branch, b.angles);
+    for (let i = 0; i < b.branch.N; i++) b.segs[i].style.transform = 'rotate(' + b.angles[i].toFixed(4) + 'deg)';
+  }
+}
+
+/* ── the desk plate ────────────────────────────────────────────────────
+   Built rather than written into the markup so the fitted numbers in DESK
+   drive the layer and the scale system from one place. */
+let deskBox = null;                   // the desk plate box; the live layer mounts here
+function buildDesk() {
+  const d = document.createElement('div');
+  d.className = 'depth';
+  d.dataset.z = DESK.z;
+  d.style.inset = 'auto';
+  d.style.left = (100 * DESK.fitX / WORLD.w).toFixed(4) + '%';
+  d.style.top = (100 * DESK.fitY / WORLD.h).toFixed(4) + '%';
+  d.style.width = (100 * DESK.w * SRC_TO_STAGE / WORLD.w).toFixed(4) + '%';
+  d.style.aspectRatio = DESK.w + '/' + DESK.h;
+
+  const img = document.createElement('img');
+  img.className = 'art';
+  img.src = DESK.src;
+  img.alt = '';
+  img.width = DESK.w; img.height = DESK.h;
+  img.draggable = false;
+  img.style.left = '0'; img.style.top = '0'; img.style.width = '100%';
+  d.appendChild(img);
+  document.getElementById('desk').appendChild(d);
+  deskBox = d;                        // hands, lamp zone and glow mount here
+}
+
+/* ── the objects ───────────────────────────────────────────────────────
+   One .depth per prop, in depth order so paint order matches the room, and
+   within a depth in table order so the left-to-right run along the bench also
+   sets who overlaps whom.
+
+   THE CONTACT SHADOW IS DRAWN HERE, NOT BAKED IN. Every asset arrived with a
+   soft shadow painted on white; the cut-out kept it as an OPAQUE pale-grey
+   smear, which over wood or carpet reads as a white smudge — the opposite of a
+   shadow. tools/prepare-assets.py deletes it from the objects on the desktop
+   and this draws a real one underneath, which is what lets a hover lift the
+   object and grow its shadow at the same time. The fixtures that never lift —
+   the desk, the chair, the door leaf — keep the artist's own shadow instead,
+   converted to honest alpha: black at alpha 1 − L/255 reproduces multiplying
+   the backdrop by L/255 EXACTLY, for any backdrop, which no CSS shadow could
+   do for a cast shadow with real floor geometry. Measured against the original
+   one-piece plate, per-channel RMS over the desk's shadow: 149.8 with the raw
+   asset, 62.5 with no shadow at all, 48.3 converted. */
+function buildProps() {
+  const byDepth = {};
+  LAYOUT.forEach(function (l) {
+    (byDepth[l.prop.z] || (byDepth[l.prop.z] = [])).push(l);
+  });
+  const frag = document.createDocumentFragment();
+  Object.keys(byDepth).map(Number).sort((a, b) => a - b).forEach(function (z) {
+    const d = document.createElement('div');
+    d.className = 'depth';
+    d.dataset.z = z;
+    byDepth[z].forEach(function (l) {
+      const p = l.prop;
+      const box = document.createElement('div');
+      box.className = 'prop';
+      box.style.left = (100 * l.left / WORLD.w).toFixed(4) + '%';
+      box.style.top = (100 * l.top / WORLD.h).toFixed(4) + '%';
+      box.style.width = (100 * l.width / WORLD.w).toFixed(4) + '%';
+      box.style.aspectRatio = p.w + '/' + p.h;
+
+      if (p.shadow) {
+        // an ellipse on the object's own footprint, in stage px so it scales
+        // with the zoom exactly as the object does. shadow[3] lifts it off the
+        // image's bottom edge, because a laptop's footprint centre is well
+        // inside its silhouette while a mug's is right at the base.
+        const sw = p.shadow[0] * l.width;
+        const sh = p.shadow[1] * sw;
+        box.style.setProperty('--sh-blur', p.shadow[2] + 'px');
+        box.style.setProperty('--sh-w', sw.toFixed(2) + 'px');
+        box.style.setProperty('--sh-h', sh.toFixed(2) + 'px');
+        box.style.setProperty('--sh-y', (p.shadow[3] * l.height).toFixed(2) + 'px');
+      } else {
+        box.classList.add('prop--noshadow');
+      }
+      if (p.lift === false) box.classList.add('prop--fixed');
+
+      const img = document.createElement('img');
+      img.className = 'prop__img';
+      img.src = 'assets/derived/' + p.src;
+      img.alt = '';
+      img.width = p.w; img.height = p.h;
+      img.draggable = false;
+      box.appendChild(img);
+
+      /* Spinnable props are real controls, not divs with a click handler:
+         focusable, Enter/Space operable, and announced. The animation is
+         driven by adding a class and removed on animationend, so a second
+         click cannot stack two animations or leave one stuck. */
+      if (p.spin) {
+        box.classList.add('prop--spinnable');
+        box.setAttribute('role', 'button');
+        box.setAttribute('tabindex', '0');
+        box.setAttribute('aria-label', 'Spin the chair');
+        box.setAttribute('data-nodrag', '');
+        /* A REAL turn now: 12 frames sliced and normalised from the owner's
+           turnaround sheet (tools note in DECISIONS §21), played once around
+           with an ease — not the old scaleX squash, which read as the chair
+           mirroring itself (owner, 2026-09-06). Ends on frame 0 (back-left,
+           the rest pose's neighbour) and swaps the painted chair back in. */
+        const spin = function () {
+          if (box.classList.contains('prop--spin')) return;   // already turning
+          if (reduceQuery.matches) return;                    // §6.6: involuntary motion only
+          SND.play('chair');
+          box.classList.add('prop--spin');
+          /* CEL animation (owner, after the crossfade ghosted two frames
+             into each other): Ghibli animates on twos with CRISP frames, so
+             the spin is discrete frames on an eased clock — fast enough at
+             the start that 12 angles read as motion, slowing into the last
+             quarter turn. No blending, no ghosts. Ends beside the rest pose
+             and hands back to the painted chair with a tiny settle rock. */
+          const bh = box.clientHeight, fw = bh * 324 / 448;
+          const mkOv = function () {
+            const o = document.createElement('div');
+            o.className = 'chair-spin';
+            o.style.width = fw + 'px';
+            o.style.height = bh + 'px';
+            o.style.left = ((box.clientWidth - fw) / 2) + 'px';
+            o.style.backgroundSize = (fw * 41) + 'px ' + bh + 'px';
+            box.appendChild(o);
+            return o;
+          };
+          const ov = mkOv(), ovB = mkOv();
+          img.style.visibility = 'hidden';
+          /* cartoon timing: constant FAST rotation (frames at ~75 ms read
+             as motion, not slides), only the last two frames get brief
+             holds, then the settle rock. Long eased tails made each late
+             frame hold 300+ ms — the owner's "zero smoothness". */
+          /* v4: a full revolution of mismatched AI frames flickers no
+             matter the timing. A real person in a small room NUDGES the
+             chair: it swivels out a quarter turn and swings back. Only the
+             four adjacent back-view frames are used — they share style, so
+             nothing flickers — on a sine pendulum. */
+          /* v6: 41 white-keyed frames of the video's REAL rotation (a seek
+             race had been duplicating the first frames — the "tiny arc" was
+             an extraction bug, not Sora). Sub-frame CROSSFADE between
+             adjacent frames: with temporally consistent frames blending is
+             ghost-free, so the sweep is as smooth as playing the video. */
+          const t0 = performance.now(), DUR = 3000;
+          (function stepSpin(now) {
+            const u = Math.min(1, (now - t0) / DUR);
+            const x = 40 * Math.sin(u * Math.PI);
+            const f = Math.min(39, Math.floor(x)), frac = x - Math.floor(x);
+            ov.style.backgroundPosition = (-f * fw) + 'px 0';
+            ovB.style.backgroundPosition = (-Math.min(40, f + 1) * fw) + 'px 0';
+            ovB.style.opacity = frac.toFixed(3);
+            if (u < 1) { requestAnimationFrame(stepSpin); return; }
+            ov.remove(); ovB.remove();
+            img.style.visibility = '';
+            img.style.transformOrigin = '50% 92%';
+            const r0 = performance.now();
+            (function rock(n2) {
+              const v = Math.min(1, (n2 - r0) / 650);
+              img.style.transform = 'rotate(' + (2.2 * Math.sin(v * Math.PI * 3) * (1 - v)).toFixed(2) + 'deg)';
+              if (v < 1) requestAnimationFrame(rock);
+              else { img.style.transform = ''; box.classList.remove('prop--spin'); }
+            })(r0);
+          })(t0);
+        };
+        box.addEventListener('click', spin);
+        box.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spin(); }
+        });
+        img.addEventListener('animationend', function () { box.classList.remove('prop--spin'); });
+      }
+
+      if (p.jelly) buildJelly(box, img);
+
+      d.appendChild(box);
+    });
+    frag.appendChild(d);
+  });
+  document.getElementById('props').appendChild(frag);
+}
+
+buildDesk();
+buildWindows();
+buildEntryWindow();
+buildProps();
+
+const depthGroups = Array.prototype.map.call(
+  el.stage.querySelectorAll('.depth'),
+  (node) => ({ el: node, s: depthFactor(parseFloat(node.dataset.z), PERSPECTIVE), last: '' })
+);
+
+const reduceQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+const camera = createCamera({ world: WORLD, pois: POIS });
+const cam = camera.cam;
+
+/* Composition tells the camera where home is. The pull-back allowance now
+   stops AT the whole-model fit: the extra 1.3x used to let the view pull
+   wider than the plates' painted bleed can cover, and the composition
+   visibly came apart there — seams, the sky backstop above the window, the
+   desk on bare white (owner's screenshot, 2026-09-04). The push-in allowance
+   shrinks by HOME_BOOST, so the maximum raster scale — and therefore the
+   memory budget of §3.1 — is unchanged at 4.2x the whole-room fit. */
+camera.cfg.homeBoost = HOME_BOOST;
+camera.cfg.homeFocus = HOME_FOCUS;
+camera.cfg.zOutLog = Math.log(HOME_BOOST);
+camera.cfg.zInLog = Math.log(4.2 / HOME_BOOST);
+
+let rect = { left: 0, top: 0 };       // §2.1 — cached; never measured inside a handler
+
+function measure() {
+  const r = el.viewport.getBoundingClientRect();
+  rect = { left: r.left, top: r.top };
+  camera.setViewport(r.width || window.innerWidth, r.height || window.innerHeight);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §6  RENDERER — one transform per composited node, plus the raster hint.
+
+       §3.3: will-change: transform pins the compositor's raster scale
+       (kMinScaleRatioForWillChangeTransform = 0.25f in picture_layer_impl.cc),
+       which is exactly why zoomed content goes soft when it is left on. ON at
+       gesture start, OFF ~180 ms after the motion settles.
+   ══════════════════════════════════════════════════════════════════════ */
+/* 180 ms was too eager: every zoom-pause-zoom rhythm demoted and re-promoted
+   the stage, and each cycle re-rasters AND re-decodes the plates (measured:
+   ~150 ms of ImageDecodeTask per handback at DPR 2 — the decoded-image cache
+   does not survive the demotion). At 500 ms a thinking pause keeps the layer;
+   sharpness still lands well under a second after the visitor truly stops. */
+const RASTER_HANDBACK_MS = 500;
+let rasterOn = false;
+let lastMotion = 0;
+let lastStageTransform = '';
+
+function markMoving(now) {
+  lastMotion = now;
+  if (rasterOn) return;
+  rasterOn = true;
+  el.stage.style.willChange = 'transform';
+}
+
+function maybeHandBackRaster(now) {
+  if (!rasterOn || camera.isBusy(now) || now - lastMotion < RASTER_HANDBACK_MS) return;
+  rasterOn = false;
+  el.stage.style.willChange = 'auto';               // cc re-rasters at the ideal scale
+  // Settle is the only safe moment to write the variable the hotspot min-size
+  // depends on: nobody clicks mid-gesture. §6.5(c)
+  el.stage.style.setProperty('--k-settled', Math.exp(cam.z).toFixed(4));
+}
+
+const drift = { x: 0, y: 0, tx: 0, ty: 0 };
+el.viewport.addEventListener('pointermove', function (e) {
+  if (!sceneIsRoom) return;
+  drift.tx = ((e.clientX / window.innerWidth) - 0.5) * 22;
+  drift.ty = ((e.clientY / window.innerHeight) - 0.5) * 15;
+}, { passive: true });
+
+function render(now) {
+  drift.x += (drift.tx - drift.x) * 0.075;
+  drift.y += (drift.ty - drift.y) * 0.075;
+  const k = Math.exp(cam.z);
+  const t = 'translate3d(' + (cam.x + drift.x).toFixed(2) + 'px,' + (cam.y + drift.y).toFixed(2) + 'px,0) scale(' + k.toFixed(5) + ')';
+  if (t !== lastStageTransform) {
+    lastStageTransform = t;
+    el.stage.style.transform = t;                   // ONE write, ONE composited node
+    markMoving(now);
+  }
+
+  /* Per-layer parallax. §4.1: for flat planes at fixed depth the CSS
+     perspective projection collapses algebraically to a constant 2D
+     multiplier s = P/(P − z), so screen_i = s_i·pan + k·world_i and the extra
+     pre-scale offset is (s_i − 1)·pan/k. Going via CSS 3D would be the same
+     result by a more fragile route — and would flatten silently the moment
+     any layer used opacity<1, filter, clip-path, mask-image or contain:paint,
+     two of which this scene uses.
+
+     One correction to that formula as written: `pan` must be measured from the
+     reference framing, or the layers are already sheared apart at the home
+     view. Rebasing it onto the world point at the viewport centre also makes
+     it stable under zoom, which the raw form is not:
+         offset_i = (1 − s_i)·(c − c₀),   c = (viewCentre − pan)/k          */
+  const cx = (camera.view.w * 0.5 - cam.x - drift.x) / k - WORLD.w / 2;
+  const cy = (camera.view.h * 0.5 - cam.y - drift.y) / k - WORLD.h / 2;
+  for (let i = 0; i < depthGroups.length; i++) {
+    const g = depthGroups[i];
+    if (g.s === 1) continue;                        // the reference plane never writes
+    const f = 1 - g.s;
+    const s = 'translate3d(' + (cx * f).toFixed(2) + 'px,' + (cy * f).toFixed(2) + 'px,0)';
+    if (s !== g.last) { g.last = s; g.el.style.transform = s; }
+  }
+}
+
+/* The rubber band is a purely visual signal, so it needs a text equivalent,
+   and under reduced motion there is no band at all. §6.5, §6.6 */
+let atZoomLimit = '';
+function announceLimits() {
+  const at = camera.zoomLimitState();
+  if (at === atZoomLimit) return;
+  atZoomLimit = at;
+  el.live.textContent = at === 'max' ? 'Closest view. Nothing further to zoom into.'
+                      : at === 'min' ? 'Widest view. The whole room is visible.' : '';
+  el.btnIn.setAttribute('aria-disabled', at === 'max' ? 'true' : 'false');
+  el.btnOut.setAttribute('aria-disabled', at === 'min' ? 'true' : 'false');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §7  THE LOOP — one rAF, one pass.
+   ══════════════════════════════════════════════════════════════════════ */
+let lastTs = 0;
+let fps = 60;
+
+function frame(ts) {
+  requestAnimationFrame(frame);
+
+  const raw = lastTs ? ts - lastTs : 16.7;
+  lastTs = ts;
+  if (raw > 0) fps += ((1000 / raw) - fps) * 0.12;
+
+  // Clamp dt against tab-switch and long-frame spikes, exactly as Motion's own
+  // batcher does with maxElapsed = 40. §2.3
+  const dt = Math.min(Math.max(raw, 1), 40) / 1000;
+
+  stepTransition(ts);
+  stepWind(ts);                                     // pure function of ts; costs nothing when idle
+  if (sceneIsRoom) {
+    camera.step(dt, ts);
+    render(ts);
+    announceLimits();
+    maybeHandBackRaster(ts);
+  }
+  updateHud(ts);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §8  INPUT
+   ══════════════════════════════════════════════════════════════════════ */
+
+const tracker = createVelocityTracker(100);
+const classifyWheel = createWheelClassifier();
+
+/* §2.8 — the wheel listener MUST be registered with addEventListener and
+   { passive: false }. A passive listener's preventDefault() is a silent
+   no-op, and the symptom is "the page scrolls behind my diorama". */
+el.viewport.addEventListener('wheel', function (e) {
+  if (e.cancelable !== false) e.preventDefault();   // mid-sequence events may be non-cancelable
+  if (!sceneIsRoom) return;
+
+  const now = performance.now();
+  const n = normalizeWheel(e);
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  markMoving(now);
+
+  if (e.ctrlKey || e.metaKey) {                     // trackpad pinch, or an explicit override
+    camera.zoomBy(dzFromPinch(n.dy), px, py, now);
+  } else if (classifyWheel(e, now) === 'wheel') {
+    if (n.dx !== 0 && n.dy === 0) {
+      camera.panBy(-n.dx, 0, now);                  // tilt-wheel: horizontal pan, was dead
+    } else {
+      camera.zoomBy(dzFromNotch(n.dy), px, py, now); // discrete detent: discard the magnitude
+    }
+  } else {
+    camera.panBy(-n.dx, -n.dy, now);                // trackpad two-finger scroll: pan
+  }
+}, { passive: false });
+
+/* Suppress Safari's own pinch-to-tab-overview. §2.7 — desktop Safari only,
+   since iOS Safari has TouchEvent as well as GestureEvent. */
+if (typeof window.GestureEvent !== 'undefined' && typeof window.TouchEvent === 'undefined') {
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (type) {
+    el.viewport.addEventListener(type, function (e) { e.preventDefault(); });
+  });
+}
+
+/* ── pointer: drag to pan, two fingers to pinch ───────────────────────── */
+const pointers = new Map();
+let pinch = null;                                   // { id1, id2, d0, z0 }
+let lastPt = { x: 0, y: 0 };
+
+const localPoint = (e) => ({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+
+el.viewport.addEventListener('pointerdown', function (e) {
+  if (e.target.closest('[data-nodrag]')) return;    // hotspots are controls, not canvas
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  // Keeps the drag alive off-window. It throws NotFoundError if the pointer is
+  // already gone by the time we get here, and an uncaught throw would abort the
+  // rest of this handler — i.e. the drag would silently never start. Capture is
+  // an enhancement, not a requirement, so losing it must not cost us the drag.
+  try { el.viewport.setPointerCapture(e.pointerId); } catch (err) { /* drag on without it */ }
+  pointers.set(e.pointerId, localPoint(e));
+  const now = performance.now();
+  markMoving(now);                                  // §3.3 — raster hint at GESTURE start
+
+  if (pointers.size === 1) {
+    camera.beginDrag(now);
+    el.viewport.dataset.dragging = '1';
+    lastPt = localPoint(e);
+    tracker.reset();
+    tracker.add(e.timeStamp, e.clientX, e.clientY);
+    return;
+  }
+  if (pointers.size === 2) {
+    const ids = Array.from(pointers.keys());
+    const a = pointers.get(ids[0]), b = pointers.get(ids[1]);
+    pinch = { id1: ids[0], id2: ids[1], d0: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), z0: cam.z };
+    camera.beginPinch(now);
+    el.viewport.dataset.dragging = '0';
+    lastPt = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    tracker.reset();
+  }
+});
+
+el.viewport.addEventListener('pointermove', function (e) {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, localPoint(e));
+  const now = performance.now();
+
+  if (pinch) {
+    const a = pointers.get(pinch.id1), b = pointers.get(pinch.id2);
+    if (!a || !b) return;
+    const d = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    camera.zoomTo(pinch.z0 + Math.log(d / pinch.d0), mx, my, now);   // 1:1 with the fingers, log space
+    camera.dragBy(mx - lastPt.x, my - lastPt.y, now);                // the midpoint also pans
+    lastPt = { x: mx, y: my };
+    return;
+  }
+
+  if (!el.viewport.dataset.dragging || el.viewport.dataset.dragging === '0') return;
+  // getCoalescedEvents returns the un-merged samples the browser batched into
+  // this move; roughly doubles the velocity samples on a 120 Hz trackpad. §2.9
+  const pts = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [e];
+  for (let i = 0; i < pts.length; i++) tracker.add(pts[i].timeStamp, pts[i].clientX, pts[i].clientY);
+
+  const p = localPoint(e);
+  camera.dragBy(p.x - lastPt.x, p.y - lastPt.y, now);
+  lastPt = p;
+});
+
+function endPointer(e, withVelocity) {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId);
+  const now = performance.now();
+
+  if (pinch && (e.pointerId === pinch.id1 || e.pointerId === pinch.id2)) {
+    pinch = null;
+    camera.endPinch(now);
+    if (pointers.size === 1) {                      // one finger left: carry on as a drag
+      lastPt = pointers.get(pointers.keys().next().value);
+      camera.resumeDrag(now);
+      el.viewport.dataset.dragging = '1';
+      tracker.reset();
+    }
+    return;
+  }
+
+  if (el.viewport.dataset.dragging !== '1') return;
+  el.viewport.dataset.dragging = '0';
+  const v = withVelocity ? tracker.get() : { vx: 0, vy: 0 };
+  camera.endDrag(v.vx, v.vy, now);
+}
+
+el.viewport.addEventListener('pointerup', function (e) { endPointer(e, true); });
+el.viewport.addEventListener('pointercancel', function (e) { endPointer(e, false); });
+
+/* ── keyboard and on-screen controls ──────────────────────────────────── */
+/* Both route through the SAME springs as the gestures, so keyboard use does
+   not feel like a different, worse product. §6.5 */
+function nudge(dx, dy) {
+  const now = performance.now();
+  markMoving(now);
+  camera.panBy(dx, dy, now);
+}
+
+function zoomStep(dz) {
+  const now = performance.now();
+  markMoving(now);
+  // Keyboard and buttons zoom about the viewport centre — there is no cursor.
+  camera.zoomBy(dz, camera.view.w * 0.5, camera.view.h * 0.5, now);
+}
+
+function goHome() {
+  markMoving(performance.now());
+  camera.home(0);
+}
+
+el.viewport.addEventListener('keydown', function (e) {
+  if (e.metaKey || e.altKey || e.ctrlKey) return;
+  const step = e.shiftKey ? 240 : 80;
+  switch (e.key) {
+    case 'ArrowLeft':  nudge(step, 0); break;
+    case 'ArrowRight': nudge(-step, 0); break;
+    case 'ArrowUp':    nudge(0, step); break;
+    case 'ArrowDown':  nudge(0, -step); break;
+    case '+': case '=': zoomStep(0.22); break;
+    case '-': case '_': zoomStep(-0.22); break;
+    case '0': goHome(); break;
+    case 'Escape': leaveRoom(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+window.addEventListener('keydown', function (e) {
+  if (e.key !== 'd' && e.key !== 'D') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  el.hud.hidden = !el.hud.hidden;
+});
+
+el.ui.addEventListener('click', function (e) {
+  const btn = e.target.closest('button[data-cmd]');
+  if (!btn || btn.getAttribute('aria-disabled') === 'true') return;
+  switch (btn.dataset.cmd) {
+    case 'left':     nudge(120, 0); break;
+    case 'right':    nudge(-120, 0); break;
+    case 'up':       nudge(0, 120); break;
+    case 'down':     nudge(0, -120); break;
+    case 'zoom-in':  zoomStep(0.26); break;
+    case 'zoom-out': zoomStep(-0.26); break;
+    case 'home':     goHome(); break;
+    case 'exit':     leaveRoom(); break;
+  }
+});
+
+/* A visible, non-spatial list of the same destinations. §6.5 */
+POIS.forEach(function (poi) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = poi.label;
+  b.addEventListener('click', function () {
+    SND.play('flip');
+    markMoving(performance.now());
+    camera.flyTo(poi);
+    el.viewport.focus();
+  });
+  el.pois.appendChild(b);
+});
+
+window.addEventListener('resize', function () {
+  measure();
+  // k changed, so the leaf's closed pose did. Not while a transition is
+  // running: the frame carries a scale() then, and getBoundingClientRect
+  // reports the transformed box, which would poison k.
+  // posedAngle is normally 0; ?door=<deg> pins it so a resize (which headless
+  // Chrome fires after load) cannot silently reset the pose being screenshotted.
+  if (!transition) { measureDoor(); setDoorAngle(posedAngle); }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   §9  DOOR ENTRY AND EXIT
+       One time-based tween, stepped by the same rAF loop. No second loop.
+   ══════════════════════════════════════════════════════════════════════ */
+/* natural-motion.md §3.4. The knob turns first and the leaf does not move for
+   160 ms: that beat is what says the mechanism responded before the mass did,
+   and its absence is half of why the old door read synthetic. */
+const T = {
+  knob: 160,        // latch retracts. THE LEAF DOES NOT MOVE.
+  swing: 1250,      // 0 -> DOOR_OPEN_DEG on doorEase — owner: 900 was too fast
+  bloomIn: 700,     // the bloom starts rising here
+  swap: 1600,       // scenes exchange at full white
+  bloomOut: 800,
+  exitIn: 620,
+  exitOut: 700
+};
+const ENTRY_ZOOM = Math.log(1.16);   // the room resolves outward from 1.16x
+
+let sceneIsRoom = false;
+let transition = null;                              // { kind, t0 }
+
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+
+/* ── the door swing ────────────────────────────────────────────────────
+   natural-motion.md §3.3. A shove blended with a guided stop:
+     f_cd  the step response of a critically damped 2nd-order system —
+           starts from rest, accelerates briefly, decays for a long time
+     f_mj  Flash & Hogan's minimum-jerk quintic — zero velocity AND zero
+           acceleration at both ends
+   The blend is monotone over 200,001 samples, so overshoot is structurally
+   impossible. That is the point: a hinged door has no restoring torque and
+   physically cannot bounce, so a spring is the wrong model for it however
+   nice springs are everywhere else in this file.
+   At 900 ms and 78 deg: peak 148.1 deg/s at 197 ms, terminal 5.12 deg/s. */
+const DOOR_K = 6.0, DOOR_M = 0.35, DOOR_NORM = 0.98264873;   // 1 − 7·e⁻⁶
+const doorEase = (u) =>
+  (1 - DOOR_M) * ((1 - (1 + DOOR_K * u) * Math.exp(-DOOR_K * u)) / DOOR_NORM) +
+  DOOR_M * (u * u * u * (10 - 15 * u + 6 * u * u));
+
+/* ── the leaf's geometry, all measured in the entry plate's pixels ─────
+   CLOSED POSE. The leaf's four corners in assets/website-entry-design.png,
+   from sub-pixel line fits on the seams around it:
+     left  (free) edge   x = 586.3, vertical           (both vertical edges are
+     right (hinge) edge  x = 808.5, vertical            exactly vertical, which
+     top    y = 0.11595·x + 178.45   sd 0.14 px         is what an axonometric
+     bottom y = −0.09489·x + 974.05  sd 0.13 px         projection does)
+   giving TL (586.3, 246.6) TR (808.5, 272.4) BR (808.5, 897.3) BL (586.3, 918.4).
+   The two vertical edges are 671.8 and 625.0 px — a ratio of 1.075, so the art
+   carries mild perspective and the leaf is a TRAPEZOID, not a parallelogram.
+   The closed pose is therefore a projective map, so that at rest the leaf is
+   pixel-for-pixel the painted door and cannot "jump" on the first frame.
+
+   THE SWING. natural-motion.md §3.5: under a parallel projection the projected
+   leaf at any angle is an exact affine image of the projected closed leaf, and
+   the whole thing reduces to three scalars:
+     g = uy/ux   u = the closed bottom edge, hinge -> free
+     p = vx/ux   v = the ground direction perpendicular to the door wall,
+     q = vy/ux       pointing the way the door opens, at the same WORLD length
+   u is read straight off the fit above: (−222.2, +21.1), so g = −0.09496.
+
+   v HAD TO BE MEASURED, and here is how. Direction: the base of the corridor's
+   near-side wall, visible through the opening in assets/without-door.png,
+   is a ground line perpendicular to the door wall. Fitted over x 658..750 by
+   sub-pixel gradient peaks: slope +0.22447, sd 0.17 px. Cross-checked against
+   the entry plate's own carpet, whose front-left edge is parallel to it:
+   +0.21881 over 275 px. Length: for a parallel projection with yaw φ and
+   elevation e, a horizontal axis at azimuth α projects with slope
+   tan(φ)·sin(e) or cot(φ)·sin(e), so the two measured slopes give
+     sin e = sqrt(0.09489 × 0.22447) = 0.14595   (e = 8.39°)
+     tan φ = sqrt(0.09489 / 0.22447) = 0.65018   (φ = 33.03°)
+   and the screen length per unit world length on the two axes is
+     |X| = 0.84194, |Y| = 0.55896, ratio 0.66389.
+   So |v| = 0.66389 × |u| = 148.2 px along (−0.97573, −0.21902), i.e.
+   v = (−144.6, −32.5). Then p = 0.65068, q = 0.14604 — and note p comes out
+   at tan φ and q at sin e, which is the check that the derivation closed.
+
+   THE SIGN AND THE STOP. m11(ψ) = cos ψ + p·sin ψ goes through zero — the leaf
+   edge-on — at ψ = 123.0°, so POSITIVE ψ is the safe direction and 78° leaves
+   m11 = 0.844, comfortably clear. Swung the other way it would invert at −56.9°,
+   less than three-quarters of the way through a 78° swing. This is why the old
+   −96° looked wrong: it went edge-on and then MIRRORED, for 40% of the
+   animation. Apparent width peaks at 119.3% at ψ = 33.0° before narrowing,
+   which is the part nobody eyeballs correctly. */
+const DOOR = {
+  TL: [586.3, 246.6], TR: [808.5, 272.4], BR: [808.5, 897.3], BL: [586.3, 918.4],
+  asset: { w: 580, h: 1297, inset: 2 },     // the cut-out's 2 px transparent margin
+  /* THE OPEN ANGLE: 72 degrees, and "open it less" turns out to be backwards
+     for this door. Because the camera sits 30.5 deg off the door's normal on
+     the KNOB side, the leaf's own face covers the doorway until it has turned
+     a long way: measured, the aperture is 0% uncovered below 43.69 deg, only
+     4.7% at 50, 14.0% at 60 and 27.7% at 72. The previous 50 deg therefore
+     revealed almost nothing, which is why it still read as a picture moving
+     rather than a door opening. 72 deg is 80% of the ADA "fully open" datum
+     and shows 53% of everything a 90-deg door could ever reveal.
+     Edge-on is at 120.5 deg, so there is no ceiling worth respecting here. */
+  /* OUTWARD (2026-09-06). The inward swing was geometrically right and
+     perceptually unreadable: from this plate's camera (30.5 deg off the
+     normal, knob side) the aperture is 0% uncovered below 43.69 deg, so half
+     the animation was a leaf narrowing in place — the owner's "it's just
+     shrinking", reported four times. Opened TOWARD the viewer there is no
+     dead zone: the corridor reveals from the first degree and the leaf
+     visibly sweeps out of the plane. +52 clears the doorway fully while
+     stopping short of the window casing. */
+  open: 52                                 // degrees; positive = outward (toward viewer)
+};
+
+/* ── THE LEAF'S CAMERA, SOLVED FROM THE PLATE ──────────────────────────
+   research/door-swing.md §4.5. The previous two constructions were both
+   provably wrong for this plate:
+
+     - the parallel affine froze the free/hinge height ratio at exactly 1.0751
+       at EVERY angle. That one frozen column is the "it just squishes" the
+       owner reported: no camera behaves that way.
+     - perspective(P) rotateY(psi) cannot represent this door at all. The
+       correct swing is WIDER AND SHORTER between 0 and 43.7 deg (107.8% wide
+       at 21.2 deg while the free edge is 94.1% tall), and a 149,959-sample
+       scan found no (P, angle) pair that does both. Worse, the P it would
+       need goes NEGATIVE past ~61 deg, which is a CSS syntax error.
+
+   So the pose is one absolute matrix3d per frame, built from a 3x4 camera
+   solved out of the artwork. The closed pose is not a separate factor any
+   more — it IS this camera at psi = 0 — so there is no composition order left
+   to get backwards, which is the bug that cost a round earlier.
+
+   The plate is two-point: both stiles are exactly vertical, so no roll, no
+   pitch. The leaf's own top and bottom edges meet at (3769.114, 616.162),
+   fixing the horizon at 53.07% of frame. With the principal point at plate
+   centre, that plus the corridor vanishing point gives f = 1467 px and places
+   the camera 6.16 leaf-widths out, 30.50 deg off the door's normal on the KNOB
+   side. That 30.50 deg is exactly why the leaf widens before it narrows, and
+   why the corridor stays hidden until 43.69 deg. */
+const DOORCAM = {
+  vzx: -19.0,      // corridor-depth vanishing point x, on the horizon (the one soft number)
+  ppx: 677.0,      // principal point x = 1354 / 2 (assumed; door-swing.md §8)
+  ambient: 0.4443, // measured: shadowed / sunlit linear luma on the plate's own wood
+  amb90: 0.2685    // measured: doorway reveal vs architrave face, i.e. a 90-deg plane
+};
+
+/** P = [c1 c2 c3 c4] acting on (u, v, w, 1) in leaf units:
+      u along the wall, 0 at the hinge stile, 1 at the free stile
+      v down,           0 at the head,        1 at the foot
+      w into the corridor, in the SAME unit as u
+    so the swing is simply (u, v, w) = (cos psi, v, sin psi). Solved once. */
+function doorCameraBuild() {
+  const src = [[0, 0], [1, 0], [1, 1], [0, 1]];
+  const dst = [DOOR.TR, DOOR.TL, DOOR.BL, DOOR.BR];
+  const A = [], B = [];
+  for (let k = 0; k < 4; k++) {
+    const x = src[k][0], y = src[k][1], X = dst[k][0], Y = dst[k][1];
+    A.push([x, y, 1, 0, 0, 0, -X * x, -X * y]); B.push(X);
+    A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y]); B.push(Y);
+  }
+  for (let c = 0; c < 8; c++) {                       // Gaussian elimination
+    let p = c;
+    for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    const tA = A[c]; A[c] = A[p]; A[p] = tA;
+    const tB = B[c]; B[c] = B[p]; B[p] = tB;
+    for (let r = 0; r < 8; r++) {
+      if (r === c) continue;
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k];
+      B[r] -= f * B[c];
+    }
+  }
+  const s = B.map((v, k) => v / A[k][k]);
+  const c1 = [s[0], s[3], s[6]], c2 = [s[1], s[4], s[7]], c4 = [s[2], s[5], 1];
+  const Xx = c1[0] / c1[2], yh = c1[1] / c1[2];       // 3769.114, 616.162
+  /* c3 is the corridor VP, scaled so one unit of w is one unit of u in the
+     WORLD. f cancels: |K^-1 c1| = |K^-1 c3| reduces to the square root below.
+     The sign is not free — homogeneous depth must GROW into the corridor, and
+     c1[2] is negative because the wall comes toward the camera, so c3 takes
+     |c1[2]|. Flip it and the leaf advances as it opens instead of receding. */
+  const q = Math.abs(c1[2]) * Math.sqrt(Math.abs(Xx - DOORCAM.ppx) /
+                                        Math.abs(DOORCAM.ppx - DOORCAM.vzx));
+  return { c1: c1, c2: c2, c3: [q * DOORCAM.vzx, q * yh, q], c4: c4 };
+}
+const DCAM = doorCameraBuild();
+const DAI = DOOR.asset.inset,
+      DAW = DOOR.asset.w - 2 * DOOR.asset.inset,
+      DAH = DOOR.asset.h - 2 * DOOR.asset.inset;
+
+/** The leaf at psi degrees INTO the corridor, as one absolute matrix3d.
+    No per-frame 8x8 solve: the plane homography at psi is exactly
+    [c1 cos psi + c3 sin psi | c2 | c4], and the asset's box maps to (u, v) by
+    a fixed affine, so a frame is two trig calls and ~20 multiplies.
+    k = frameWidth / 1354: a projective map is not scale invariant, so the
+    translation column is multiplied by k and the perspective row divided. */
+function doorPoseMatrix(psiDeg, k) {
+  const r = psiDeg * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r);
+  const u0 = DCAM.c1[0] * cs + DCAM.c3[0] * sn,
+        u1 = DCAM.c1[1] * cs + DCAM.c3[1] * sn,
+        u2 = DCAM.c1[2] * cs + DCAM.c3[2] * sn;
+  const e = (DOOR.asset.w - DAI) / DAW, m = DAI / DAH;
+  const i  = u2 * e - DCAM.c2[2] * m + DCAM.c4[2];
+  const a  = -u0 / DAW / i, d = -u1 / DAW / i, g = -u2 / DAW / i;
+  const b  = DCAM.c2[0] / DAH / i, ee = DCAM.c2[1] / DAH / i, h = DCAM.c2[2] / DAH / i;
+  const c  = (u0 * e - DCAM.c2[0] * m + DCAM.c4[0]) / i;
+  const f  = (u1 * e - DCAM.c2[1] * m + DCAM.c4[1]) / i;
+  return 'matrix3d(' + [a, d, 0, g / k, b, ee, 0, h / k, 0, 0, 1, 0, c * k, f * k, 0, 1]
+    .map((v) => v.toFixed(9)).join(',') + ')';
+}
+
+const SHADOW_DIR = [-0.9822, 0.1875];   // plate-space, from the light solve
+const SHADOW_LEN = 36;                  // plate px at full open, x sin psi
+const SHADOW_PAD = 96;                  // baked canvas margin, asset px — see tools/bake-door-shadow.py
+const DOOR_T = 0.05;                    // leaf thickness in leaf-width units (~4.4 cm of ~88)
+
+/** The end-grain slab at the free stile, from the SAME camera. The stile's
+    thickness line at rest is (u, w) = (1, s·t), s in [0,1]; rotated by psi it
+    is (cos psi − s·t·sin psi, sin psi + s·t·cos psi), which is LINEAR in s —
+    so the slab is one homography with columns
+      A = t·(−sin psi · c1 + cos psi · c3)      (the s direction)
+      B = c2                                    (v, straight down the stile)
+      C = cos psi · c1 + sin psi · c3 + c4      (the front free-edge line)
+    and a frame costs the same two trig calls as the leaf. Its s = 0 line IS
+    the leaf's u = 1 edge, so the two surfaces share that edge exactly and
+    painter's order (slab first) resolves visibility with no math. */
+function doorEdgeMatrix(psiDeg, k) {
+  const r = psiDeg * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r);
+  const W = 32, H = 1293;
+  const A = [], C = [];
+  for (let j = 0; j < 3; j++) {
+    A[j] = DOOR_T * (-sn * DCAM.c1[j] + cs * DCAM.c3[j]);
+    C[j] = cs * DCAM.c1[j] + sn * DCAM.c3[j] + DCAM.c4[j];
+  }
+  const i = C[2];
+  const a = A[0] / W / i, d = A[1] / W / i, g = A[2] / W / i;
+  const b = DCAM.c2[0] / H / i, ee = DCAM.c2[1] / H / i, hh = DCAM.c2[2] / H / i;
+  return 'matrix3d(' + [a, d, 0, g / k, b, ee, 0, hh / k, 0, 0, 1, 0,
+                        C[0] / i * k, C[1] / i * k, 0, 1]
+    .map((v) => v.toFixed(9)).join(',') + ')';
+}
+
+/** Face light at psi degrees, >= 0: a gamma-encoded Lambert.
+
+    The light comes from image-RIGHT, the window/hinge side — an earlier
+    comment in this file said upper LEFT and was backwards.
+
+    Applied as the black .door-shade at opacity (1 - b), which composites to
+    exactly img·b — the same arithmetic as the old brightness(b) filter, which
+    is a plain sRGB multiply (verified: #bb581d at 0.7 rasterises to exactly
+    131,62,20) — so the Lambert result is gamma-encoded before use. The SHAPE
+    matters more than the endpoint: a cosine is nearly flat for the first few
+    degrees (0.983 at 10 deg) and reads as a surface rotating out of the
+    light, where a linear ramp reads as a dimmer being turned down. */
+function doorFaceLight(psi) {
+  const p = psi * Math.PI / 180;      // SIGNED: outward (negative) brightens
+  return Math.pow(DOORCAM.amb90 + (DOORCAM.ambient - DOORCAM.amb90) * Math.cos(p) +
+                  (1 - DOORCAM.ambient) *
+                  Math.max(0, Math.cos(p + 0.2617994) / 0.9659258), 1 / 2.2);
+}
+
+/* k depends on the rendered frame width, so it is cached and never read inside
+   the swing: a getBoundingClientRect() per frame is a forced layout. */
+let doorK = 1;
+let posedAngle = 0;                 // pinned by ?door=<deg>, see the bootstrap below
+function measureDoor() {
+  doorK = (el.doorFrame.getBoundingClientRect().width || 1354) / 1354;
+}
+
+/** Place the leaf at psiDeg. The file's external sign is kept: NEGATIVE is
+    inward, away from the viewer, so ?door=-30 still means what it meant.
+    psiDeg = 0 is exactly the painted door — doorPoseMatrix(0, 1) maps asset
+    (2,2) -> (586.30, 246.60) and (578,1295) -> (808.50, 897.30), the measured
+    corners — so there is no first-frame jump. */
+function setDoorAngle(psiDeg) {
+  const psi = -psiDeg, pa = Math.abs(psi);
+  const pose = doorPoseMatrix(psi, doorK);
+  el.doorLeaf.style.transform = pose;
+  /* Every write below is transform or opacity — compositor work. The leaf
+     carries no filter and the shade's/shadow's filters are static, so nothing
+     re-rasterises during the swing (the old per-frame doorLeafFilter() cost
+     ~233 ms of RasterTask across the 1.4 s swing at DPR 2). */
+  el.doorShade.style.transform = pose;
+  el.doorShade.style.opacity = Math.max(0, 1 - doorFaceLight(psi)).toFixed(4);
+  /* The slab: hidden at rest (its projection folds exactly behind the leaf
+     and a subpixel AA sliver could show), faded in over the first degrees. */
+  el.doorEdge.style.transform = doorEdgeMatrix(psi, doorK);
+  el.doorEdge.style.opacity = pa < 0.4 ? '0' : Math.min(1, pa / 4).toFixed(3);
+  const s = Math.sin(pa * Math.PI / 180);
+  /* Ramp the shadow in: the painting already contains the closed door's own
+     shadow, so drawing one at psi = 0 would double it and break the
+     bit-identical closed pose. Under 0.5 deg there is no shadow at all. */
+  el.doorShadow.style.opacity = (psi <= 0 || s < 0.009) ? '0' : (0.36 * Math.min(1, pa / 8)).toFixed(3);
+  /* The plate-space offset goes OUTSIDE the pose — that is exactly the
+     displacement the old drop-shadow approximated by pushing the offset back
+     through the pose's centre Jacobian (drop-shadow lengths live in the
+     element's local space and get transformed). The inner translate aligns
+     the baked canvas's padded origin with the leaf's. */
+  const off = (-SHADOW_PAD * doorK).toFixed(2);
+  el.doorShadow.style.transform =
+    'translate(' + (SHADOW_DIR[0] * SHADOW_LEN * s * doorK).toFixed(2) + 'px, ' +
+                   (SHADOW_DIR[1] * SHADOW_LEN * s * doorK).toFixed(2) + 'px) ' +
+    pose + ' translate(' + off + 'px, ' + off + 'px)';
+}
+
+function setBloom(a, scale) {
+  el.bloom.style.opacity = a.toFixed(3);
+  el.bloom.style.transform = 'scale(' + scale.toFixed(3) + ')';
+}
+
+/* §3.3 again, for the transition's own movers. These three are the only
+   elements that animate during the door sequence, and they animate for a
+   known, bounded time, so the hint goes on when the sequence starts and off
+   the frame it ends — never left declared in the stylesheet. */
+function setTransitionRaster(on) {
+  const v = on ? 'transform, opacity' : 'auto';
+  el.bloom.style.willChange = v;
+  el.doorLeaf.style.willChange = on ? 'transform' : 'auto';
+  el.doorShadow.style.willChange = v;
+  el.doorShade.style.willChange = v;
+  el.doorEdge.style.willChange = v;
+}
+
+function showRoom(zOffsetLog) {
+  sceneIsRoom = true;
+  SND.ambience(true);
+  el.doorScene.hidden = true;
+  el.viewport.hidden = false;
+  el.ui.hidden = false;
+  el.hint.hidden = false;
+  measure();                                        // sizes the camera and anchors it centrally
+  camera.home(zOffsetLog);                          // ... and again, with the entry zoom
+  lastStageTransform = '';
+  render(performance.now());
+  el.viewport.focus();
+}
+
+function showDoor() {
+  sceneIsRoom = false;
+  SND.ambience(false);
+  el.viewport.hidden = true;
+  el.ui.hidden = true;
+  el.hint.hidden = true;
+  el.doorScene.hidden = false;
+  el.enterKnob.hidden = false;
+  el.enterKnob.style.transform = '';
+  el.knobTwist.hidden = false;
+  el.knobTwist.style.transform = '';
+  setDoorAngle(0);
+  el.doorFrame.style.transform = 'none';
+  el.enterKnob.focus();
+}
+
+function endTransition() {
+  transition = null;
+  setBloom(0, 1);
+  setTransitionRaster(false);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   SOUNDS — Kenney RPG Audio (CC0, kenney.nl/assets/rpg-audio), one pack so
+   the room sounds like one designed set (research/sounds.md, top-3 note).
+   Every play() follows a user gesture, so autoplay policy never blocks.
+   Files live in design-lab/sounds/; ledger in research/sound-credits.md.
+   ══════════════════════════════════════════════════════════════════════ */
+const SND = (function () {
+  const files = {
+    latch:     ['sounds/metalLatch.ogg', 0.5],
+    doorOpen:  ['sounds/doorOpen_2.ogg', 0.45],
+    doorClose: ['sounds/doorClose_1.ogg', 0.45],
+    chair:     ['sounds/creak1.ogg', 0.55],
+    squish:    ['sounds/cloth1.ogg', 0.35],
+    lampSwitch: ['sounds/metalClick.ogg', 0.5],
+    flip:      ['sounds/page-turn.m4a', 0.35]
+  };
+  /* EAGER, not lazy: cloneNode of a not-yet-loaded Audio plays silence, so
+     lazy creation made the FIRST play of every sound mute (the owner's
+     "chair is not creaking"). All five load at startup — ~60 KB total. */
+  const cache = {};
+  for (const k in files) { cache[k] = new Audio(files[k][0]); cache[k].preload = 'auto'; }
+  /* the owner's Freesound room tone (CC0, kyles 637807), looped low under
+     the room scene only */
+  const tone = new Audio('sounds/room-tone.m4a');
+  tone.preload = 'auto'; tone.loop = true; tone.volume = 0.14;
+  function ambience(on) {
+    if (on) tone.play().catch(function () {}); else tone.pause();
+  }
+  function play(name) {
+    const f = files[name];
+    let n = cache[name];
+    if (!n.paused) n = n.cloneNode();      // clone only for overlapping plays
+    n.volume = f[1];
+    n.play().catch(function () {});        // a blocked play is not an error
+  }
+  return { play: play, ambience: ambience };
+})();
+
+function enterRoom() {
+  if (transition || sceneIsRoom) return;
+  if (reduceQuery.matches) { el.enterKnob.hidden = true; el.knobTwist.hidden = true; setBloom(0, 1); showRoom(0); return; }
+  setTransitionRaster(true);
+  SND.play('latch');
+  transition = { kind: 'enter', t0: performance.now() };
+}
+
+function leaveRoom() {
+  if (transition || !sceneIsRoom) return;
+  if (reduceQuery.matches) { setBloom(0, 1); showDoor(); return; }
+  setTransitionRaster(true);
+  SND.play('doorClose');
+  transition = { kind: 'exit', t0: performance.now() };
+}
+
+function stepTransition(now) {
+  if (!transition) return;
+  const t = now - transition.t0;
+
+  if (transition.kind === 'enter') {
+    if (t < T.swap) {
+      /* The knob's 160 ms. There is no separable knob asset — the leaf carries
+         its own painted knob — so the beat is spent on the glow, which
+         brightens and settles while the leaf stays exactly where it was. */
+      if (t < T.knob) {
+        /* A PRESS, not a swell: the halo contracts onto the knob and springs
+           back, like a latch being worked. The old +34% grow read as the glow
+           inflating, which is backwards for an actuation.
+           `transform` composes with the .door-knob rule's own translate/scale
+           properties, so this is a pure extra scale on top of the pulse. */
+        el.enterKnob.style.transform = 'scale(' + (1 - 0.30 * Math.sin(t / T.knob * Math.PI)).toFixed(3) + ')';
+        /* the disc IS the painted knob's pixels, so at 0 deg it is invisible;
+           sweeping to -40 deg and back moves the painted highlight = a twist */
+        el.knobTwist.style.transform = 'rotate(' + (-40 * Math.sin(t / T.knob * Math.PI)).toFixed(2) + 'deg)';
+      } else if (!el.enterKnob.hidden) {
+        el.enterKnob.hidden = true;                 // the latch has cleared
+        el.knobTwist.hidden = true;                 // the hand lets go with it
+        SND.play('doorOpen');                       // and the hinge speaks once
+      }
+      setDoorAngle(DOOR.open * doorEase(clamp((t - T.knob) / T.swing, 0, 1)));
+      const e = easeInOut(clamp((t - T.bloomIn) / (T.swap - T.bloomIn), 0, 1));
+      setBloom(e, 0.35 + 2.55 * e);
+      /* The FRAME does not move. It used to scale up 5% with the bloom, and
+         that is what made the whole doorway read as "opening up" with the
+         leaf (owner, 2026-09-04): to a person standing at a door, the frame
+         is architecture. The push-in feel is carried by the bloom plus the
+         room resolving outward from ENTRY_ZOOM after the swap. */
+      return;
+    }
+    if (!sceneIsRoom) showRoom(ENTRY_ZOOM);
+    const out = clamp((t - T.swap) / T.bloomOut, 0, 1);
+    setBloom(1 - easeOutCubic(out), 2.9 + 0.6 * out);
+    if (out >= 1) endTransition();
+    return;
+  }
+
+  if (t < T.exitIn) {
+    const e = easeInOut(t / T.exitIn);
+    setBloom(e, 0.4 + 2.5 * e);
+    return;
+  }
+  if (sceneIsRoom) showDoor();
+  const out = clamp((t - T.exitIn) / T.exitOut, 0, 1);
+  setBloom(1 - easeOutCubic(out), 2.9 + 0.5 * out);
+  if (out >= 1) endTransition();
+}
+
+el.enterKnob.addEventListener('click', enterRoom);
+el.exitKnob.addEventListener('click', leaveRoom);
+
+/* ══════════════════════════════════════════════════════════════════════
+   §10 DEBUG READOUT — D toggles it. Throttled, because the HUD must not
+       cost a style recalc on every frame.
+   ══════════════════════════════════════════════════════════════════════ */
+let hudDue = 0;
+
+const BUILD = 'b12 · 2026-09-11';
+document.title += '  [' + BUILD + ']';
+console.info('diorama build', BUILD);
+function updateHud(now) {
+  if (el.hud.hidden || now < hudDue) return;
+  hudDue = now + 110;
+  // The camera does not run on the door scene, so do not print stale numbers.
+  const live = sceneIsRoom;
+  el.hud.textContent =
+    'scale    ' + (live ? Math.exp(cam.z).toFixed(4) + '  (z ' + cam.z.toFixed(4) + ')' : '—') + '\n' +
+    'x        ' + (live ? cam.x.toFixed(1) : '—') + '\n' +
+    'y        ' + (live ? cam.y.toFixed(1) : '—') + '\n' +
+    'fps      ' + fps.toFixed(1) + '\n' +
+    'will-chg ' + (rasterOn ? 'ON' : 'off') + '\n' +
+    'state    ' + (live ? camera.mode(now) : 'door') + '\n' +
+    'anchor   ' + camera.anchor.x.toFixed(0) + ', ' + camera.anchor.y.toFixed(0) + '\n' +
+    'sway     ' + (windT0 === null ? 'off' : windSwayDeg((now - windT0) / 1000).toFixed(3) + ' deg') + '\n' +
+    'z limits ' + camera.limits.zMin.toFixed(3) + ' .. ' + camera.limits.zMax.toFixed(3) + '\n' +
+    'build    ' + BUILD;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   §11 BOOT
+   ══════════════════════════════════════════════════════════════════════ */
+function syncMotionPreference() {
+  camera.setReducedMotion(reduceQuery.matches);
+}
+reduceQuery.addEventListener('change', syncMotionPreference);
+
+syncMotionPreference();
+measure();
+measureDoor();
+setDoorAngle(0);
+if (window.location.hash === '#room') showRoom(0);
+/* Still-frame hooks for headless verification (rAF barely advances there):
+   ?door=<deg> poses the leaf; ?wind=<seconds> freezes the sway at that time. */
+(function () {
+  const q = new URLSearchParams(window.location.search);
+  if (q.has('door')) {
+    const d = parseFloat(q.get('door')) || 0;
+    /* Synchronously, NOT inside requestAnimationFrame: headless Chrome under
+       --virtual-time-budget barely runs rAF, so a pose set there never reaches
+       the screenshot even though it does reach the DOM. Reading a layout
+       property first forces the layout measureDoor() needs. */
+    void el.doorFrame.getBoundingClientRect().width;
+    posedAngle = d;
+    measureDoor();
+    el.enterKnob.hidden = el.knobTwist.hidden = d !== 0;
+    setDoorAngle(d);
+  }
+  if (q.has('wind')) windFreezeT = parseFloat(q.get('wind')) || 0;   // stepWind honours this
+})();
+
+/* The module boundary, and the surface the verification harness drives.
+   createCamera is DOM-free, so a harness can spin up its own instances and
+   step them at any dt without touching this page's scene at all. */
+/* ══════════════════════════════════════════════════════════════════════
+   SELF-AUDIT. Runs once on load and complains in the console.
+
+   This exists because placement and proportion errors were repeatedly being
+   found by eye — a doubled iPod, a laptop covering 85% of the books — after
+   they had already shipped. Eyeballing a diorama is exactly the kind of check
+   a human is bad at and arithmetic is good at, so the file now checks itself.
+
+   Two tests:
+     SIZE   every prop's declared cm against the real object's dimensions.
+     OVERLAP  every pair's RENDERED rectangles. The earlier check compared only
+            u-extents within a row, which is why the laptop hiding the books
+            passed it: a tall front object occludes a shorter back object at
+            the same u no matter what v says, because the desk's whole depth is
+            only ~58 screen px while the objects are 20-80 px tall.
+   ══════════════════════════════════════════════════════════════════════ */
+const REAL_CM = {                        // {min, max} for the actual object
+  clock: [10, 12], lamp: [35, 40], books: [16, 26], photos: [12, 18], jelly: [6, 12],
+  folder: [29, 32], ipod: [10, 15], notebook: [19, 22], laptop: [32, 40],
+  letter: [18, 26], mug: [10, 13], note: [7, 9], chair: [95, 125]
+};
+const OVERLAP_LIMIT = 0.25;              // >25% of the smaller reads as hiding
+
+/* Objects that LIE on the wood. The desk is only ~58 screen px deep while the
+   props are 20-80 px tall, so a flat object placed too far back necessarily
+   pokes out past the desk's far edge and reads as floating in the window —
+   which is exactly what the books were doing at v = 0.80 (their own height is
+   39 px, so their ceiling was v = 0.32). Things that genuinely stand up — the
+   laptop, the lamp, the clock, the mug — are allowed to rise above it. */
+const FLAT_ON_DESK = ['books', 'folder', 'letter', 'photos', 'notebook', 'ipod'];
+
+function auditScene() {
+  const bad = [];
+  PROPS.forEach(function (p) {
+    const r = REAL_CM[p.id];
+    if (r && (p.cm < r[0] || p.cm > r[1])) {
+      bad.push('SIZE  ' + p.id + ' declared ' + p.cm + 'cm, real is ' + r[0] + '-' + r[1] + 'cm');
+    }
+  });
+  const laid = PROPS.filter((p) => p.on === 'desk').map(layoutProp);
+  for (let i = 0; i < laid.length; i++) {
+    for (let j = i + 1; j < laid.length; j++) {
+      const a = laid[i], b = laid[j];
+      const ox = Math.max(0, Math.min(a.left + a.width, b.left + b.width) - Math.max(a.left, b.left));
+      const oy = Math.max(0, Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top));
+      const frac = (ox * oy) / Math.min(a.width * a.height, b.width * b.height);
+      if (frac > OVERLAP_LIMIT) {
+        bad.push('OVERLAP  ' + a.prop.id + ' x ' + b.prop.id + '  ' + Math.round(frac * 100) + '% of the smaller');
+      }
+    }
+  }
+  const deskDepthPx = Math.abs(DESK.faceDepth[1]) * SRC_TO_STAGE;
+  laid.forEach(function (l) {
+    if (FLAT_ON_DESK.indexOf(l.prop.id) === -1) return;
+    const room = deskDepthPx * (1 - l.prop.at[1]);
+    if (l.height > room + 0.5) {
+      bad.push('FLOATS  ' + l.prop.id + ' is ' + Math.round(l.height) + 'px tall but only ' +
+               Math.round(room) + 'px of desk remains behind it — it crosses the far edge');
+    }
+  });
+  if (bad.length) console.warn('[diorama audit]\n  ' + bad.join('\n  '));
+  return bad;
+}
+
+/* the night veil sits above every depth group; fireflies live in each tree
+   pane, above the branches, under the glaze */
+(function buildNight() {
+  const veil = document.createElement('div');
+  veil.className = 'night-veil';
+  el.stage.appendChild(veil);
+  /* on the SLOT, after the glaze: firefly light sits on the glass, not
+     drowned behind it (they were 55% dimmed at night — invisible) */
+  const panes = document.querySelectorAll('#windows .depth');
+  panes.forEach(function (paneDepth) {
+    const pane = paneDepth.parentElement;
+    for (let i = 0; i < 8; i++) {
+      const f = document.createElement('div');
+      f.className = 'firefly';
+      /* inside the aperture: TREE_BOX is the tree canvas in world px, and the
+         pane clip covers its middle — the old full-stage percentages put most
+         fireflies outside the clip, i.e. invisible (owner: "not there") */
+      f.style.left = (100 * (TREE_BOX.left + (0.22 + Math.random() * 0.56) * TREE_BOX.side) / WORLD.w) + '%';
+      f.style.top = (100 * (TREE_BOX.top + (0.16 + Math.random() * 0.42) * TREE_BOX.side) / WORLD.h) + '%';
+      f.style.setProperty('--ff-dur', (9 + Math.random() * 7).toFixed(1) + 's');
+      f.style.setProperty('--ff-x1', (Math.random() * 60 - 30).toFixed(0) + 'px');
+      f.style.setProperty('--ff-y1', (-Math.random() * 50).toFixed(0) + 'px');
+      f.style.setProperty('--ff-x2', (Math.random() * 60 - 30).toFixed(0) + 'px');
+      f.style.setProperty('--ff-y2', (-Math.random() * 40).toFixed(0) + 'px');
+      f.style.setProperty('--ff-x3', (Math.random() * 40 - 20).toFixed(0) + 'px');
+      f.style.setProperty('--ff-y3', (-Math.random() * 60).toFixed(0) + 'px');
+      f.style.animationDelay = (-Math.random() * 9).toFixed(1) + 's, ' + (-Math.random() * 3).toFixed(1) + 's';
+      pane.appendChild(f);
+    }
+  });
+})();
+
+/* The live layer over the desk painting: IST clock hands on the painted
+   clock, and the lamp as the night switch. Percent positions are of the desk
+   plate's own box; refined against a rendered still. */
+(function mountDeskLive() {
+  if (!deskBox) return;
+  const mk = function (cls) {
+    const d2 = document.createElement('div');
+    d2.className = cls;
+    deskBox.appendChild(d2);
+    return d2;
+  };
+  const hh = mk('clock-hand clock-hand--h'), mh = mk('clock-hand clock-hand--m');
+  mk('clock-hand clock-cap');
+  const setIST = function () {
+    const now = new Date();
+    const ist = new Date(now.getTime() + (now.getTimezoneOffset() + 330) * 60000);
+    const mm = ist.getMinutes() + ist.getSeconds() / 60;
+    const h2 = (ist.getHours() % 12) + mm / 60;
+    hh.style.transform = 'rotate(' + (h2 * 30).toFixed(1) + 'deg)';
+    mh.style.transform = 'rotate(' + (mm * 6).toFixed(1) + 'deg)';
+  };
+  setIST(); setInterval(setIST, 20000);
+
+  const zone = document.createElement('button');
+  zone.type = 'button';
+  zone.className = 'lamp-zone';
+  zone.setAttribute('aria-label', 'Pull the lamp chain: toggle night');
+  zone.setAttribute('data-nodrag', '');
+  /* soft contact shadows under the three visible feet — grounds the
+     extended legs on the carpet */
+  [[6.4, 61.6], [77.0, 98.9], [94.7, 92.7]].forEach(function (pt) {
+    const sh = document.createElement('div');
+    sh.className = 'leg-shadow';
+    sh.style.left = pt[0] + '%';
+    sh.style.top = pt[1] + '%';
+    deskBox.appendChild(sh);
+  });
+  for (let w = 0; w < 2; w++) {
+    const wisp = document.createElement('div');
+    wisp.className = 'mug-steam';
+    wisp.style.left = (83.1 + w * 1.5) + '%';
+    wisp.style.animationDelay = (w * 1.7) + 's';
+    deskBox.appendChild(wisp);
+  }
+  for (const cls of ['lamp-pool']) {
+    const g2 = document.createElement('div');
+    g2.className = cls;
+    deskBox.appendChild(g2);
+  }
+  const chain = document.createElement('img');
+  chain.src = 'assets/derived/lamp-chain.png';
+  chain.className = 'lamp-string';
+  chain.alt = ''; chain.draggable = false;
+  deskBox.appendChild(chain);
+  zone.addEventListener('click', function () {
+    SND.play('lampSwitch');
+    el.stage.classList.toggle('night');
+    chain.classList.remove('lamp-string--pull');
+    void chain.offsetWidth;                       // restart the animation
+    chain.classList.add('lamp-string--pull');
+  });
+  deskBox.appendChild(zone);
+})();
+
+auditScene();   // shout in the console if a prop is mis-sized or hidden
+
+window.Diorama = Object.freeze({
+  audit: auditScene,
+  math: DioramaMath, createCamera: createCamera, camera: camera,
+  /* test hooks: pose the door at an angle, and freeze the wind at a time, so
+     stills of the swing and the sway can be rendered headlessly */
+  // inward is NEGATIVE, so hide the halo whenever the door is posed off zero
+  poseDoor: function (deg) { el.enterKnob.hidden = el.knobTwist.hidden = deg !== 0; setDoorAngle(deg); },
+  poseWind: function (t) {
+    for (const L of treeLayers) L.el.style.transform = treeLayerTransform(L, t);
+    for (const b of boughs) {
+      segmentAnglesDeg(t, b.branch, b.angles);
+      for (let i = 0; i < b.branch.N; i++) b.segs[i].style.transform = 'rotate(' + b.angles[i].toFixed(4) + 'deg)';
+    }
+  },
+  segmentAnglesDeg: segmentAnglesDeg, swayUnit: swayUnit
+});
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

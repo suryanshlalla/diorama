@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 210" width="240" height="210">
+  <!-- Placeholder jelly, hand-tuned gradients until the painted one is
+       generated (PROMPTS.md P4). Warm berry jelly, dome + soft base flare. -->
+  <defs>
+    <radialGradient id="body" cx="42%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#e8756b"/>
+      <stop offset="45%" stop-color="#c94f52"/>
+      <stop offset="80%" stop-color="#9c3344"/>
+      <stop offset="100%" stop-color="#7e2738"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="85%" r="60%">
+      <stop offset="0%" stop-color="#ff9a7a" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#ff9a7a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <path d="M 120 12
+           C 178 12 208 64 212 122
+           C 215 156 226 168 226 182
+           C 226 198 190 204 120 204
+           C 50 204 14 198 14 182
+           C 14 168 25 156 28 122
+           C 32 64 62 12 120 12 Z" fill="url(#body)"/>
+  <path d="M 120 12 C 178 12 208 64 212 122 C 215 156 226 168 226 182
+           C 226 198 190 204 120 204 C 50 204 14 198 14 182
+           C 14 168 25 156 28 122 C 32 64 62 12 120 12 Z" fill="url(#glow)"/>
+  <ellipse cx="88" cy="52" rx="26" ry="14" fill="#ffd9c4" opacity="0.55" transform="rotate(-24 88 52)"/>
+  <ellipse cx="120" cy="196" rx="100" ry="8" fill="#5e1c2c" opacity="0.35"/>
+</svg>
