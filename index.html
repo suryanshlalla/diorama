@@ -3548,10 +3548,10 @@ function auditScene() {
   mk('clock-hand clock-cap');
   const setIST = function () {
     const now = new Date();
-    const ist = new Date(now.getTime() + (now.getTimezoneOffset() + 330) * 60000);
-    const sec = ist.getSeconds();
-    const mm = ist.getMinutes() + sec / 60;
-    const h2 = (ist.getHours() % 12) + mm / 60;
+    const ist = new Date(now.getTime() + 330 * 60000);
+    const sec = ist.getUTCSeconds();
+    const mm = ist.getUTCMinutes() + sec / 60;
+    const h2 = (ist.getUTCHours() % 12) + mm / 60;
     hh.style.transform = 'rotate(' + (h2 * 30).toFixed(1) + 'deg)';
     mh.style.transform = 'rotate(' + (mm * 6).toFixed(1) + 'deg)';
     sh2.style.transform = 'rotate(' + (sec * 6) + 'deg)';

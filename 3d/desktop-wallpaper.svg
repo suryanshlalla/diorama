@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+<defs>
+  <linearGradient id="base" x2="1" y2="1"><stop stop-color="#b0d1ed"/><stop offset=".45" stop-color="#6794d8"/><stop offset="1" stop-color="#a8cbea"/></linearGradient>
+  <linearGradient id="fold" x1="0" x2="1" y2=".15"><stop stop-color="#c5e1f4"/><stop offset=".24" stop-color="#8eb8e8"/><stop offset=".68" stop-color="#5d8dd1"/><stop offset="1" stop-color="#3c69b4"/></linearGradient>
+  <linearGradient id="light" x2="1" y2=".2"><stop stop-color="#e2f0f7"/><stop offset="1" stop-color="#9bc1e9"/></linearGradient>
+</defs>
+<path fill="url(#base)" d="M0 0h1600v1000H0z"/>
+<path fill="url(#light)" d="M-80-50H250C50 170 130 330 185 510S90 850 70 1070h-170Z"/>
+<path fill="url(#fold)" d="M240-60H520C360 160 440 360 355 540S240 800 265 1060H30C80 760 75 720 175 485S105 185 240-60"/>
+<path fill="url(#light)" d="M590-60h180C535 225 810 260 665 465S530 830 480 1060H240C280 845 330 765 390 580S430 110 590-60"/>
+<path fill="url(#fold)" d="M775-60h285C850 90 895 250 837 455S740 750 690 1060H460C490 820 510 690 635 485S595 160 775-60"/>
+<path fill="url(#light)" d="M1100-60h190C1120 115 1210 310 1100 435S982 690 945 1060H690C780 710 780 595 845 435S893 160 1100-60"/>
+<path fill="url(#fold)" d="M1250-60h260C1330 160 1450 310 1360 500S1315 850 1330 1060H940C1025 770 940 630 1110 440S1030 185 1250-60"/>
+<path fill="url(#light)" d="M1600-80h130v1200h-400C1220 810 1450 625 1375 450S1500 75 1600-80"/>
+</svg>
