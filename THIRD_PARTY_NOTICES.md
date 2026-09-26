@@ -58,6 +58,11 @@ unknown need provenance review before relying on them for redistribution.
   supplied as a reference for the desktop experience. It is not claimed as an
   original work by this project; its rightsholder and permission to distribute
   it have not been verified.
+- `app/public/icons/folder-xp.png` and `app/public/icons/contact-fax-xp.png`
+  are copied from owner-supplied reference PNGs in `.context/attachments/HUb5Nx`
+  and `.context/attachments/vW5P6u`. The fax PNG includes a baked checkerboard
+  backdrop; CSS crops its empty surround without changing the source pixels.
+  Their original authors, rights, and redistribution permission are unverified.
 - Files in `design-lab/reference/` are source/reference material and are not
   copied by the current publication script. Their individual sources and
   permissions are not catalogued here.
