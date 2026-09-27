@@ -63,6 +63,15 @@ unknown need provenance review before relying on them for redistribution.
   and `.context/attachments/vW5P6u`. The fax PNG includes a baked checkerboard
   backdrop; CSS crops its empty surround without changing the source pixels.
   Their original authors, rights, and redistribution permission are unverified.
+- `app/public/icons/read-this-thx.png` and `app/public/icons/recycle-bin-full.png`
+  are copied from owner-supplied reference attachments `.context/attachments/X5XX28`
+  and `.context/attachments/2lOhRD`. The fax and full-bin RGB image pixels remain
+  unchanged. Their corresponding `*-mask.png` files are derived foreground masks
+  that hide the baked exterior checkerboard. Some checkerboard remains visible
+  through the bin's translucent glass. Original authors and redistribution
+  permissions for these supplied icons are unverified.
+- The five JPEGs under `app/public/photos/` are owner-supplied personal photos,
+  explicitly approved for public display in the photo album on 2026-09-27.
 - Files in `design-lab/reference/` are source/reference material and are not
   copied by the current publication script. Their individual sources and
   permissions are not catalogued here.

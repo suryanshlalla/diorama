@@ -25,3 +25,21 @@ contacting the maintainer.
 
 There is no stated response-time or remediation guarantee. This policy does
 not promise a security audit or that every issue will be fixed.
+
+## Repository protections
+
+On 2026-09-27, Dependabot vulnerability alerts and automated security updates
+were enabled and verified for both the private source repository and the public
+Pages repository. The public repository also has secret scanning and secret
+push protection enabled. The private repository’s API response did not expose secret-scanning settings;
+those features are not claimed as enabled there.
+
+`.github/workflows/checks.yml` validates app/content changes with unit tests,
+a dependency audit (including development dependencies), and a production build.
+Its token has read-only contents permission, checkout does not retain credentials,
+and both official actions are pinned to full commit hashes. The workflow does not
+run privileged pull-request code or have access to deployment credentials.
+
+These checks help find regressions and reported dependency vulnerabilities; they
+do not verify third-party inbox delivery, prove media redistribution rights, or
+guarantee that the application has no vulnerabilities.
